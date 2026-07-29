@@ -43,7 +43,7 @@ HISTORY_FILE = APP_DIR / ".book_quiz_history_v2.csv"
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 WIKIPEDIA_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 USER_AGENT = "MaksBookQuiz/2.0 (personal Streamlit app)"
-APP_VERSION = "Part 4.2"
+APP_VERSION = "Part 5 Pilot"
 
 SKILL_ORDER = [
     "Book identification",
@@ -799,7 +799,7 @@ def main() -> None:
     initialize_session()
 
     st.title("📚 Maks Book Memory Quiz")
-    st.caption(f"{APP_VERSION} · Identify the title first, then answer author, personal-memory, publication, and connection questions about the same book.")
+    st.caption(f"{APP_VERSION} · Identify the title first, then answer author, plot, character, theme, personal-memory, and book-context questions about the same book.")
 
     with st.sidebar:
         st.header("Booklist")
@@ -835,6 +835,12 @@ def main() -> None:
         target_mix = "Only titles"
         st.caption("Every round begins by identifying the book title. Author recall comes next.")
         difficulty = st.selectbox("Opening difficulty", ["Challenging", "Mixed", "Easier"])
+        curated_only = st.checkbox(
+            "Only books with curated deep questions",
+            value=bool(facts_by_key),
+            disabled=not bool(facts_by_key),
+            help="For the Part 5 pilot, this limits the quiz to the enriched books with separate plot, character, and theme material.",
+        )
 
     filtered_rows = filter_rows(
         prepared_rows,
@@ -844,6 +850,8 @@ def main() -> None:
         min_rating=min_rating,
     )
     books = group_books(filtered_rows)
+    if curated_only:
+        books = [item for item in books if item["book_key"] in facts_by_key]
 
     with st.sidebar:
         st.divider()
@@ -881,7 +889,7 @@ def main() -> None:
     col1.metric("Session points", f"{session_points:g}/{session_max:g}")
     col2.metric("Cumulative points", f"{total_points:g}/{total_max:g}")
     col3.metric("Recall", f"{total_recall:.0f}%" if not hist.empty else "—")
-    st.caption(f"Current quiz pool: **{len(books)} books**. {APP_VERSION} saves detailed history to a server file; durable cross-device storage comes in Part 6.")
+    st.caption(f"Current quiz pool: **{len(books)} books**. The pilot workbook contains curated deep-question material for **{len(facts_by_key)} books**. Detailed history is still stored on the Streamlit server until Part 6 adds durable storage.")
 
     if st.session_state.stage == "identify":
         render_opening(round_obj)
@@ -893,7 +901,7 @@ def main() -> None:
     with st.expander("Skill statistics"):
         st.caption("Each question is stored separately, so title, author, personal-memory, publication, and connection performance can diverge.")
         st.dataframe(skill_stats(hist), hide_index=True, use_container_width=True)
-        st.info("Part 4.2 intentionally pauses plot, character, and theme follow-ups. Part 5 will add independent curated questions that do not repeat the identification clue.")
+        st.info("Part 5 Pilot tracks plot, character, and theme recall separately for books on the Quiz Facts sheet. Questions are curated to test information distinct from the opening clue.")
 
     with st.expander("Recent results"):
         if hist.empty:

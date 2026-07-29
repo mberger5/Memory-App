@@ -29,9 +29,9 @@ OWNERSHIP_COL = "Own a copy?"
 AWARDS_COL = "Awards"
 
 FACT_SHEET = "Quiz Facts"
-# Part 4.2 deliberately disables plot/character/theme follow-ups until Part 5
-# supplies separate curated facts that do not repeat the opening clue.
-CURATED_DEEP_QUESTIONS_ENABLED = False
+# Part 5 pilot enables curated plot, character, and theme follow-ups only for
+# books that have independent entries on the Quiz Facts sheet.
+CURATED_DEEP_QUESTIONS_ENABLED = True
 FACT_COLUMNS = {
     "opening_hard": ["Opening Clue Hard", "Opening Clue"],
     "opening_medium": ["Opening Clue Medium", "Opening Clue"],
