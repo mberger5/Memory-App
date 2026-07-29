@@ -43,6 +43,7 @@ HISTORY_FILE = APP_DIR / ".book_quiz_history_v2.csv"
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 WIKIPEDIA_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 USER_AGENT = "MaksBookQuiz/2.0 (personal Streamlit app)"
+APP_VERSION = "Part 4.2"
 
 SKILL_ORDER = [
     "Book identification",
@@ -798,7 +799,7 @@ def main() -> None:
     initialize_session()
 
     st.title("📚 Maks Book Memory Quiz")
-    st.caption("Identify the book title first, then stay with that book for author, plot, personal-memory, and connection questions.")
+    st.caption(f"{APP_VERSION} · Identify the title first, then answer author, personal-memory, publication, and connection questions about the same book.")
 
     with st.sidebar:
         st.header("Booklist")
@@ -880,7 +881,7 @@ def main() -> None:
     col1.metric("Session points", f"{session_points:g}/{session_max:g}")
     col2.metric("Cumulative points", f"{total_points:g}/{total_max:g}")
     col3.metric("Recall", f"{total_recall:.0f}%" if not hist.empty else "—")
-    st.caption(f"Current quiz pool: **{len(books)} books**. This Part 4 version saves detailed history to a server file; durable cross-device storage comes in Part 6.")
+    st.caption(f"Current quiz pool: **{len(books)} books**. {APP_VERSION} saves detailed history to a server file; durable cross-device storage comes in Part 6.")
 
     if st.session_state.stage == "identify":
         render_opening(round_obj)
@@ -890,10 +891,9 @@ def main() -> None:
         render_round_end(round_obj, books, facts_by_key, target_mix, difficulty)
 
     with st.expander("Skill statistics"):
-        st.caption("Each question is stored separately, so title, author, plot, character, theme, and personal-memory performance can diverge.")
+        st.caption("Each question is stored separately, so title, author, personal-memory, publication, and connection performance can diverge.")
         st.dataframe(skill_stats(hist), hide_index=True, use_container_width=True)
-        if not facts_by_key:
-            st.info("Character and theme rows will begin filling after Part 5 adds the curated Quiz Facts sheet.")
+        st.info("Part 4.2 intentionally pauses plot, character, and theme follow-ups. Part 5 will add independent curated questions that do not repeat the identification clue.")
 
     with st.expander("Recent results"):
         if hist.empty:

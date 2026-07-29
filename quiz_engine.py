@@ -29,6 +29,9 @@ OWNERSHIP_COL = "Own a copy?"
 AWARDS_COL = "Awards"
 
 FACT_SHEET = "Quiz Facts"
+# Part 4.2 deliberately disables plot/character/theme follow-ups until Part 5
+# supplies separate curated facts that do not repeat the opening clue.
+CURATED_DEEP_QUESTIONS_ENABLED = False
 FACT_COLUMNS = {
     "opening_hard": ["Opening Clue Hard", "Opening Clue"],
     "opening_medium": ["Opening Clue Medium", "Opening Clue"],
@@ -781,12 +784,17 @@ def build_round(
     # Title is always identified first; author is always the first follow-up.
     followups: list[FollowUpQuestion] = [build_counterpart_question(book, target, books)]
 
-    deep_questions: list[FollowUpQuestion] = []
-    plot_question = build_plot_question(book, facts)
-    if plot_question is not None:
-        deep_questions.append(plot_question)
-    deep_questions.extend(build_curated_deep_questions(facts))
-    followups.extend(q for q in deep_questions if not overlaps_opening(clue, q))
+    # Plot, character, and theme questions are intentionally paused in Part 4.2.
+    # The opening clue often uses the only plot summary currently available, so
+    # reusing that summary would test short-term memory rather than book recall.
+    # Part 5 will enable these only after adding independent curated facts.
+    if CURATED_DEEP_QUESTIONS_ENABLED:
+        deep_questions: list[FollowUpQuestion] = []
+        plot_question = build_plot_question(book, facts)
+        if plot_question is not None:
+            deep_questions.append(plot_question)
+        deep_questions.extend(build_curated_deep_questions(facts))
+        followups.extend(q for q in deep_questions if not overlaps_opening(clue, q))
 
     personal = build_personal_question(book, events)
     if personal:
