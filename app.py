@@ -24,11 +24,13 @@ from quiz_engine import (
     FollowUpQuestion,
     QuizRound,
     answer_matches,
+    book_key,
     book_notes_markdown,
     build_round,
     clean_text,
     filter_rows,
     group_books,
+    has_complete_enrichment,
     normalize_answer,
     opening_skill,
     prepare_book_rows,
@@ -37,13 +39,13 @@ from quiz_engine import (
 )
 
 APP_DIR = Path(__file__).resolve().parent
-DEFAULT_WORKBOOK = APP_DIR / "Maks_Booklist_enriched_2026-06-24_updated_notes_corrected.xlsx"
+DEFAULT_WORKBOOK = APP_DIR / "Maks_Booklist_enriched_2026-07-29_quiz_facts_pilot.xlsx"
 HISTORY_FILE = APP_DIR / ".book_quiz_history_v2.csv"
 
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 WIKIPEDIA_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 USER_AGENT = "MaksBookQuiz/2.0 (personal Streamlit app)"
-APP_VERSION = "Part 5 Pilot"
+APP_VERSION = "Part 5 Pilot Fix 1"
 
 SKILL_ORDER = [
     "Book identification",
@@ -558,7 +560,7 @@ def render_opening(round_obj: QuizRound) -> None:
         else:
             st.info(st.session_state.opening_feedback)
         st.markdown(f"### The book is *{round_obj.title}*")
-        st.caption(f"By {round_obj.author}")
+        st.caption("Next: identify the author.")
         if st.button(
             "Continue with this book",
             type="primary",
@@ -799,7 +801,7 @@ def main() -> None:
     initialize_session()
 
     st.title("📚 Maks Book Memory Quiz")
-    st.caption(f"{APP_VERSION} · Identify the title first, then answer author, plot, character, theme, personal-memory, and book-context questions about the same book.")
+    st.caption(f"{APP_VERSION} · Enriched books only. Identify the title first; the author is kept hidden until the author follow-up, and every round includes a curated plot question.")
 
     with st.sidebar:
         st.header("Booklist")
@@ -816,42 +818,51 @@ def main() -> None:
             raw_books, raw_facts = load_workbook_path(str(DEFAULT_WORKBOOK))
         prepared_rows = prepare_book_rows(raw_books)
         facts_by_key = prepare_facts(raw_facts)
+        complete_fact_keys = {
+            key for key, facts in facts_by_key.items() if has_complete_enrichment(facts)
+        }
+        if not complete_fact_keys:
+            st.error(
+                "This workbook has no fully enriched Quiz Facts rows. "
+                "Each eligible book needs complete opening clues, hints, plot, character, and theme fields."
+            )
+            return
+        enriched_rows = prepared_rows[
+            prepared_rows.apply(
+                lambda row: book_key(clean_text(row.get(TITLE_COL)), clean_text(row.get(AUTHOR_COL)))
+                in complete_fact_keys,
+                axis=1,
+            )
+        ].reset_index(drop=True)
     except Exception as exc:
         st.error(f"Could not load the workbook: {exc}")
         return
 
     with st.sidebar:
         st.header("Quiz setup")
-        genre_options = sorted(unique_nonempty(prepared_rows[GENRE_COL])) if GENRE_COL in prepared_rows.columns else []
+        st.caption("Only fully enriched books are eligible. There is no fallback to uncurated questions.")
+        genre_options = sorted(unique_nonempty(enriched_rows[GENRE_COL])) if GENRE_COL in enriched_rows.columns else []
         genres = st.multiselect("Genre", genre_options)
-        author_options = sorted(unique_nonempty(prepared_rows[AUTHOR_COL]))
+        author_options = sorted(unique_nonempty(enriched_rows[AUTHOR_COL]))
         authors = st.multiselect("Author", author_options, max_selections=20)
-        year_options = sorted(unique_nonempty(prepared_rows[YEAR_READ_COL])) if YEAR_READ_COL in prepared_rows.columns else []
+        year_options = sorted(unique_nonempty(enriched_rows[YEAR_READ_COL])) if YEAR_READ_COL in enriched_rows.columns else []
         years_read = st.multiselect("Year read", year_options)
         min_rating = None
-        if RATING_COL in prepared_rows.columns and st.checkbox("Use a minimum rating", value=False):
+        if RATING_COL in enriched_rows.columns and st.checkbox("Use a minimum rating", value=False):
             min_rating = st.slider("Minimum rating", 0.0, 4.0, 2.5, 0.25)
 
         target_mix = "Only titles"
-        st.caption("Every round begins by identifying the book title. Author recall comes next.")
+        st.caption("Every round begins by identifying the title. The author is not shown until after the author question.")
         difficulty = st.selectbox("Opening difficulty", ["Challenging", "Mixed", "Easier"])
-        curated_only = st.checkbox(
-            "Only books with curated deep questions",
-            value=bool(facts_by_key),
-            disabled=not bool(facts_by_key),
-            help="For the Part 5 pilot, this limits the quiz to the enriched books with separate plot, character, and theme material.",
-        )
 
     filtered_rows = filter_rows(
-        prepared_rows,
+        enriched_rows,
         genres=genres,
         authors=authors,
         years_read=years_read,
         min_rating=min_rating,
     )
     books = group_books(filtered_rows)
-    if curated_only:
-        books = [item for item in books if item["book_key"] in facts_by_key]
 
     with st.sidebar:
         st.divider()
@@ -889,7 +900,7 @@ def main() -> None:
     col1.metric("Session points", f"{session_points:g}/{session_max:g}")
     col2.metric("Cumulative points", f"{total_points:g}/{total_max:g}")
     col3.metric("Recall", f"{total_recall:.0f}%" if not hist.empty else "—")
-    st.caption(f"Current quiz pool: **{len(books)} books**. The pilot workbook contains curated deep-question material for **{len(facts_by_key)} books**. Detailed history is still stored on the Streamlit server until Part 6 adds durable storage.")
+    st.caption(f"Current quiz pool: **{len(books)} fully enriched books**. Every round guarantees a curated plot question plus a character-or-theme question. Detailed history is still stored on the Streamlit server until Part 6 adds durable storage.")
 
     if st.session_state.stage == "identify":
         render_opening(round_obj)
@@ -901,7 +912,7 @@ def main() -> None:
     with st.expander("Skill statistics"):
         st.caption("Each question is stored separately, so title, author, personal-memory, publication, and connection performance can diverge.")
         st.dataframe(skill_stats(hist), hide_index=True, use_container_width=True)
-        st.info("Part 5 Pilot tracks plot, character, and theme recall separately for books on the Quiz Facts sheet. Questions are curated to test information distinct from the opening clue.")
+        st.info("This pilot tracks plot, character, and theme recall separately. Every eligible book has complete curated enrichment, and plot recall is guaranteed in each round.")
 
     with st.expander("Recent results"):
         if hist.empty:

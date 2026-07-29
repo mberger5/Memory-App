@@ -29,9 +29,8 @@ OWNERSHIP_COL = "Own a copy?"
 AWARDS_COL = "Awards"
 
 FACT_SHEET = "Quiz Facts"
-# Part 5 pilot enables curated plot, character, and theme follow-ups only for
-# books that have independent entries on the Quiz Facts sheet.
-CURATED_DEEP_QUESTIONS_ENABLED = True
+# A book is eligible only when the Quiz Facts sheet contains a complete,
+# independent set of title clues plus plot, character, and theme material.
 FACT_COLUMNS = {
     "opening_hard": ["Opening Clue Hard", "Opening Clue"],
     "opening_medium": ["Opening Clue Medium", "Opening Clue"],
@@ -49,6 +48,20 @@ FACT_COLUMNS = {
     "source_1": ["Source 1"],
     "source_2": ["Source 2"],
 }
+
+REQUIRED_ENRICHMENT_FIELDS = (
+    "opening_hard",
+    "opening_medium",
+    "opening_easy",
+    "hint_1",
+    "hint_2",
+    "plot_question",
+    "plot_answer",
+    "character_question",
+    "character_answer",
+    "theme_question",
+    "theme_answer",
+)
 
 
 @dataclass
@@ -311,12 +324,13 @@ def decade_label(year: int | None) -> str:
     return f"{(year // 10) * 10}s"
 
 
-def redact_answer_terms(text: str, terms: Iterable[str]) -> str:
+def redact_answer_terms(text: str, terms: Iterable[str], replacement: str = "[answer hidden]") -> str:
     redacted = clean_text(text)
     for term in sorted(unique_nonempty(terms), key=len, reverse=True):
         if len(normalize_answer(term)) < 4:
             continue
-        redacted = re.sub(re.escape(term), "[answer hidden]", redacted, flags=re.IGNORECASE)
+        pattern = rf"(?<!\w){re.escape(term)}(?!\w)"
+        redacted = re.sub(pattern, replacement, redacted, flags=re.IGNORECASE)
     return redacted
 
 
@@ -326,6 +340,10 @@ def fact_value(facts: dict, key: str) -> str:
         if value:
             return value
     return ""
+
+
+def has_complete_enrichment(facts: dict) -> bool:
+    return bool(facts) and all(fact_value(facts, key) for key in REQUIRED_ENRICHMENT_FIELDS)
 
 
 def choose_target(target_mix: str) -> str:
@@ -396,16 +414,18 @@ def build_hints(book: dict, facts: dict, target: str, all_books: list[dict]) -> 
         if decade:
             hint_1_bits.append(f"it was first published in the {decade}")
         if country:
-            hint_1_bits.append(f"the author is associated with {country}")
+            hint_1_bits.append(f"its author is associated with {country}")
         hint_1 = "; ".join(hint_1_bits) + "." if hint_1_bits else "Think about the central premise in the clue."
 
-        hint_2_bits = [f"It was written by {author}"]
+        hint_2_bits = []
         if series:
-            hint_2_bits.append(f"and belongs to the {series} series")
-        else:
-            initials = title_initials(title)
-            if initials:
-                hint_2_bits.append(f"and its title pattern is {initials}")
+            hint_2_bits.append(f"It belongs to the {series} series")
+        initials = title_initials(title)
+        if initials:
+            hint_2_bits.append(f"its title pattern is {initials}")
+        if not hint_2_bits:
+            words = [word for word in re.findall(r"[A-Za-z0-9]+", title)]
+            hint_2_bits.append(f"The title contains {len(words)} word{'s' if len(words) != 1 else ''}")
         return [" ".join(hint_1.split()), "; ".join(hint_2_bits) + "."]
 
     # Author target
@@ -730,7 +750,10 @@ def build_knowledge_question(book: dict, current_key: str, all_books: list[dict]
         )
 
     country = clean_text(book.get(COUNTRY_COL))
-    if country:
+    # Country-of-origin recall is intentionally rare. It can fill a gap when no
+    # other context question exists, or appear very occasionally among richer
+    # publication/series/connection choices.
+    if country and (not candidates or random.random() < 0.05):
         country_pool = [item["book"].get(COUNTRY_COL) for item in all_books]
         candidates.append(
             FollowUpQuestion(
@@ -765,36 +788,45 @@ def build_round(
     events = current["events"]
     key = current["book_key"]
     facts = (facts_by_key or {}).get(key, {})
+    if not has_complete_enrichment(facts):
+        raise ValueError("The selected book is missing required Quiz Facts enrichment.")
 
     title = clean_text(book.get(TITLE_COL))
     author = clean_text(book.get(AUTHOR_COL))
     target = "title"
     clue = select_opening_clue(book, facts, difficulty)
-    # The author may be part of a fair title clue; only the title itself must be
-    # hidden before identification.
-    clue = redact_answer_terms(clue, title_aliases(title))
+    # Neither the title nor the author may be revealed before their respective
+    # recall questions. This also protects against a workbook summary that names
+    # the author inside the title-identification clue.
+    clue = redact_answer_terms(clue, title_aliases(title), "[title hidden]")
+    clue = redact_answer_terms(clue, author_redaction_terms(author), "the author")
 
     prompt = f"**Which book is this?**\n\n> {clue}"
     answer = title
     aliases = title_aliases(title)
 
     hints = build_hints(book, facts, target, books)
+    safe_hints: list[str] = []
+    for hint in hints:
+        hint = redact_answer_terms(hint, title_aliases(title), "[title hidden]")
+        hint = redact_answer_terms(hint, author_redaction_terms(author), "the author")
+        safe_hints.append(hint)
+    hints = safe_hints
     options = build_options(current, books, target)
 
-    # Title is always identified first; author is always the first follow-up.
+    # Fixed opening sequence: title first, author second, plot immediately after.
     followups: list[FollowUpQuestion] = [build_counterpart_question(book, target, books)]
+    plot_question = build_plot_question(book, facts)
+    if plot_question is None:
+        raise ValueError("The selected book is missing a curated plot question.")
+    followups.append(plot_question)
 
-    # Plot, character, and theme questions are intentionally paused in Part 4.2.
-    # The opening clue often uses the only plot summary currently available, so
-    # reusing that summary would test short-term memory rather than book recall.
-    # Part 5 will enable these only after adding independent curated facts.
-    if CURATED_DEEP_QUESTIONS_ENABLED:
-        deep_questions: list[FollowUpQuestion] = []
-        plot_question = build_plot_question(book, facts)
-        if plot_question is not None:
-            deep_questions.append(plot_question)
-        deep_questions.extend(build_curated_deep_questions(facts))
-        followups.extend(q for q in deep_questions if not overlaps_opening(clue, q))
+    # Add one additional deep-recall question each round. Repeated rounds can
+    # therefore build separate character and theme statistics without making
+    # every round unnecessarily long.
+    additional_deep = build_curated_deep_questions(facts)
+    if additional_deep:
+        followups.append(random.choice(additional_deep))
 
     personal = build_personal_question(book, events)
     if personal:
@@ -802,14 +834,6 @@ def build_round(
     knowledge = build_knowledge_question(book, key, books)
     if knowledge:
         followups.append(knowledge)
-
-    # Keep rounds brisk now; curated Part 5 data can add one character and one theme
-    # prompt while preserving the plot/personal/bibliographic mix.
-    if len(followups) > 5:
-        fixed = followups[:2]
-        extras = followups[2:]
-        random.shuffle(extras)
-        followups = fixed + extras[:3]
 
     return QuizRound(
         round_id=str(uuid.uuid4()),
