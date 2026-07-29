@@ -1,505 +1,180 @@
 from __future__ import annotations
 
+import hashlib
 import json
-import random
 import re
-import unicodedata
-from urllib.error import URLError, HTTPError
+import time
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import Iterable
 
 import pandas as pd
 import streamlit as st
 
+from quiz_engine import (
+    AUTHOR_COL,
+    FACT_SHEET,
+    GENRE_COL,
+    RATING_COL,
+    TITLE_COL,
+    YEAR_READ_COL,
+    FollowUpQuestion,
+    QuizRound,
+    answer_matches,
+    book_notes_markdown,
+    build_round,
+    clean_text,
+    filter_rows,
+    group_books,
+    normalize_answer,
+    opening_skill,
+    prepare_book_rows,
+    prepare_facts,
+    unique_nonempty,
+)
+
 APP_DIR = Path(__file__).resolve().parent
-DEFAULT_WORKBOOK = APP_DIR / "Maks_Booklist_enriched_2026-04-25.xlsx"
-HISTORY_FILE = APP_DIR / ".book_quiz_history.csv"
+DEFAULT_WORKBOOK = APP_DIR / "Maks_Booklist_enriched_2026-06-24_updated_notes_corrected.xlsx"
+HISTORY_FILE = APP_DIR / ".book_quiz_history_v2.csv"
 
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 WIKIPEDIA_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/"
-USER_AGENT = "MaksBookQuiz/1.0 (personal Streamlit app)"
+USER_AGENT = "MaksBookQuiz/2.0 (personal Streamlit app)"
 
-REQUIRED_COLUMNS = {"Name", "Author"}
-
-QUIZ_MODES = [
-    "Title → Author",
-    "Author → Title",
-    "Summary → Title",
-    "Summary → Author",
-    "Published earlier/later",
-    "Your rating: higher/lower",
+SKILL_ORDER = [
+    "Book identification",
+    "Author identification",
+    "Characters",
+    "Plot",
+    "Themes",
+    "Personal reading memory",
+    "Publication knowledge",
+    "Connections",
 ]
 
 MOBILE_CSS = """
 <style>
     .block-container {
-        padding-top: 1.1rem;
-        padding-bottom: 4rem;
-        max-width: 720px;
+        padding-top: 1rem;
+        padding-bottom: 5rem;
+        max-width: 760px;
     }
     div.stButton > button {
-        min-height: 3.1rem;
+        min-height: 3rem;
         white-space: normal;
-        text-align: left;
-        border-radius: 0.75rem;
-        font-size: 1.02rem;
+        border-radius: 0.8rem;
+        font-size: 1rem;
         line-height: 1.25;
     }
     div[data-testid="stMetric"] {
-        background: rgba(250, 250, 250, 0.65);
-        padding: .45rem .55rem;
-        border-radius: .75rem;
-        border: 1px solid rgba(49, 51, 63, 0.12);
-    }
-    section[data-testid="stSidebar"] div.stButton > button {
-        min-height: 2.5rem;
-        text-align: center;
+        background: rgba(250, 250, 250, 0.68);
+        padding: .5rem .6rem;
+        border-radius: .8rem;
+        border: 1px solid rgba(49, 51, 63, 0.13);
     }
     .question-card {
-        padding: 0.85rem 1rem;
-        border: 1px solid rgba(49, 51, 63, 0.14);
+        padding: 1rem 1.05rem;
+        border: 1px solid rgba(49, 51, 63, 0.15);
         border-radius: 1rem;
-        background: rgba(250, 250, 250, 0.7);
-        margin-bottom: 0.75rem;
+        background: rgba(250, 250, 250, 0.72);
+        margin: .4rem 0 .8rem 0;
+    }
+    .subtle-card {
+        padding: .75rem .9rem;
+        border-radius: .8rem;
+        background: rgba(128, 128, 128, 0.08);
+        margin: .35rem 0;
+    }
+    section[data-testid="stSidebar"] div.stButton > button {
+        min-height: 2.6rem;
     }
 </style>
 """
 
 
-@dataclass(frozen=True)
-class Question:
-    prompt: str
-    options: list[str]
-    answer: str
-    explanation: str
-    source_title: str
-    source_author: str
-    mode: str
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 
-
-def clean_text(value: object) -> str:
-    if value is None or pd.isna(value):
-        return ""
-    text = str(value).strip()
-    if text.lower() in {"nan", "none", "nat"}:
-        return ""
-    return text
-
-
-def normalize_answer(value: object) -> str:
-    """Normalize typed quiz answers so minor punctuation/case differences do not matter."""
-    text = clean_text(value)
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
-    text = text.lower().replace("&", "and")
-    text = re.sub(r"[^a-z0-9]+", " ", text).strip()
-    text = re.sub(r"^(the|a|an)\s+", "", text)
-    return re.sub(r"\s+", " ", text)
-
-
-def answers_match(choice: object, answer: object) -> bool:
-    return normalize_answer(choice) == normalize_answer(answer)
-
-
-def to_number(value: object) -> float | None:
-    text = clean_text(value).replace(",", "")
-    if not text:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [clean_text(c) for c in df.columns]
-    for col in df.columns:
-        if df[col].dtype == object:
-            df[col] = df[col].map(clean_text)
-    return df
+@st.cache_data(show_spinner=False)
+def load_workbook_bytes(data: bytes) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    excel = pd.ExcelFile(BytesIO(data))
+    if "Book List" not in excel.sheet_names:
+        raise ValueError("Workbook does not contain a Book List sheet.")
+    books = pd.read_excel(excel, sheet_name="Book List", dtype=str)
+    facts = pd.read_excel(excel, sheet_name=FACT_SHEET, dtype=str) if FACT_SHEET in excel.sheet_names else None
+    return books, facts
 
 
 @st.cache_data(show_spinner=False)
-def load_workbook(path_or_bytes, sheet_name: str) -> pd.DataFrame:
-    df = pd.read_excel(path_or_bytes, sheet_name=sheet_name, dtype=str)
-    return normalize_cols(df)
+def load_workbook_path(path: str) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    excel = pd.ExcelFile(path)
+    if "Book List" not in excel.sheet_names:
+        raise ValueError("Workbook does not contain a Book List sheet.")
+    books = pd.read_excel(excel, sheet_name="Book List", dtype=str)
+    facts = pd.read_excel(excel, sheet_name=FACT_SHEET, dtype=str) if FACT_SHEET in excel.sheet_names else None
+    return books, facts
 
 
-@st.cache_data(show_spinner=False)
-def sheet_names(path_or_bytes) -> list[str]:
-    return pd.ExcelFile(path_or_bytes).sheet_names
+def pool_signature(books: list[dict], target_mix: str, difficulty: str) -> str:
+    raw = "|".join(sorted(item["book_key"] for item in books)) + f"::{target_mix}::{difficulty}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def has_required_columns(df: pd.DataFrame) -> bool:
-    return REQUIRED_COLUMNS.issubset(set(df.columns))
+# ---------------------------------------------------------------------------
+# History and statistics
+# ---------------------------------------------------------------------------
+
+HISTORY_COLUMNS = [
+    "timestamp",
+    "round_id",
+    "book_key",
+    "title",
+    "author",
+    "stage",
+    "skill",
+    "subtype",
+    "question",
+    "answer_mode",
+    "assistance",
+    "user_answer",
+    "correct_answer",
+    "result_score",
+    "points_awarded",
+    "max_points",
+    "response_seconds",
+]
 
 
-def is_likely_dnf_row(row: pd.Series) -> bool:
-    haystack_cols = [
-        "Type",
-        "Quick Summary/Notes (written at the time)",
-        "Notes (written much later)",
-        "Favorite Stories",
-    ]
-    text = " | ".join(clean_text(row.get(c, "")) for c in haystack_cols).lower()
-    return "dnf" in text or "did not finish" in text
-
-
-def filter_books(
-    df: pd.DataFrame,
-    *,
-    exclude_dnf: bool,
-    genres: list[str],
-    types: list[str],
-    authors: list[str],
-    min_rating: float | None,
-    year_read_values: list[str],
-) -> pd.DataFrame:
-    filtered = df.copy()
-    filtered = filtered[filtered["Name"].map(bool) & filtered["Author"].map(bool)]
-
-    if exclude_dnf:
-        filtered = filtered[~filtered.apply(is_likely_dnf_row, axis=1)]
-
-    if genres and "Genre (Simple)" in filtered.columns:
-        filtered = filtered[filtered["Genre (Simple)"].isin(genres)]
-
-    if types and "Type" in filtered.columns:
-        filtered = filtered[filtered["Type"].isin(types)]
-
-    if authors:
-        filtered = filtered[filtered["Author"].isin(authors)]
-
-    if year_read_values and "Year Read" in filtered.columns:
-        filtered = filtered[filtered["Year Read"].isin(year_read_values)]
-
-    if min_rating is not None and "Rating (Normalized)" in filtered.columns:
-        ratings = filtered["Rating (Normalized)"].map(to_number)
-        filtered = filtered[ratings.fillna(-1) >= min_rating]
-
-    return filtered.reset_index(drop=True)
-
-
-def unique_nonempty(values: Iterable[object]) -> list[str]:
-    return sorted({clean_text(v) for v in values if clean_text(v)})
-
-
-def sample_distractors(df: pd.DataFrame, col: str, answer: str, n: int = 3) -> list[str]:
-    pool = [x for x in unique_nonempty(df[col]) if x != answer]
-    random.shuffle(pool)
-    return pool[:n]
-
-
-def make_question(df: pd.DataFrame, mode: str) -> Question | None:
-    if len(df) < 4:
-        return None
-
-    rows = df.to_dict("records")
-
-    if mode == "Title → Author":
-        row = random.choice(rows)
-        answer = clean_text(row["Author"])
-        distractors = sample_distractors(df, "Author", answer)
-        if len(distractors) < 3:
-            return None
-        options = distractors + [answer]
-        random.shuffle(options)
-        title = clean_text(row["Name"])
-        return Question(
-            prompt=f"Who wrote *{title}*?",
-            options=options,
-            answer=answer,
-            explanation=book_explanation(row),
-            source_title=title,
-            source_author=answer,
-            mode=mode,
-        )
-
-    if mode == "Author → Title":
-        row = random.choice(rows)
-        answer = clean_text(row["Name"])
-        distractors = sample_distractors(df, "Name", answer)
-        if len(distractors) < 3:
-            return None
-        options = distractors + [answer]
-        random.shuffle(options)
-        author = clean_text(row["Author"])
-        return Question(
-            prompt=f"Which of these did **{author}** write?",
-            options=options,
-            answer=answer,
-            explanation=book_explanation(row),
-            source_title=answer,
-            source_author=author,
-            mode=mode,
-        )
-
-    if mode == "Summary → Title":
-        eligible = [r for r in rows if clean_text(r.get("Summary (AI)"))]
-        if len(eligible) < 4:
-            return None
-        row = random.choice(eligible)
-        answer = clean_text(row["Name"])
-        distractors = sample_distractors(df, "Name", answer)
-        if len(distractors) < 3:
-            return None
-        options = distractors + [answer]
-        random.shuffle(options)
-        return Question(
-            prompt=f"Which work is this?\n\n> {clean_text(row.get('Summary (AI)'))}",
-            options=options,
-            answer=answer,
-            explanation=book_explanation(row),
-            source_title=answer,
-            source_author=clean_text(row["Author"]),
-            mode=mode,
-        )
-
-    if mode == "Summary → Author":
-        eligible = [r for r in rows if clean_text(r.get("Summary (AI)"))]
-        if len(eligible) < 4:
-            return None
-        row = random.choice(eligible)
-        answer = clean_text(row["Author"])
-        distractors = sample_distractors(df, "Author", answer)
-        if len(distractors) < 3:
-            return None
-        options = distractors + [answer]
-        random.shuffle(options)
-        return Question(
-            prompt=f"Who wrote the work described here?\n\n> {clean_text(row.get('Summary (AI)'))}",
-            options=options,
-            answer=answer,
-            explanation=book_explanation(row),
-            source_title=clean_text(row["Name"]),
-            source_author=answer,
-            mode=mode,
-        )
-
-    if mode == "Published earlier/later":
-        eligible = [r for r in rows if to_number(r.get("Year Published")) is not None]
-        if len(eligible) < 4:
-            return None
-        a, b = random.sample(eligible, 2)
-        while to_number(a.get("Year Published")) == to_number(b.get("Year Published")) and len(eligible) > 2:
-            a, b = random.sample(eligible, 2)
-        ask_earlier = random.choice([True, False])
-        ya = int(to_number(a.get("Year Published")))
-        yb = int(to_number(b.get("Year Published")))
-        answer_row = a if (ya < yb) == ask_earlier else b
-        answer = clean_text(answer_row["Name"])
-        prompt_word = "earlier" if ask_earlier else "later"
-        options = [clean_text(a["Name"]), clean_text(b["Name"])]
-        return Question(
-            prompt=f"Which was published **{prompt_word}**?",
-            options=options,
-            answer=answer,
-            explanation=f"*{clean_text(a['Name'])}* was published in {ya}; *{clean_text(b['Name'])}* was published in {yb}.",
-            source_title=answer,
-            source_author=clean_text(answer_row["Author"]),
-            mode=mode,
-        )
-
-    if mode == "Your rating: higher/lower":
-        eligible = [r for r in rows if to_number(r.get("Rating (Normalized)")) is not None]
-        if len(eligible) < 4:
-            return None
-        a, b = random.sample(eligible, 2)
-        while to_number(a.get("Rating (Normalized)")) == to_number(b.get("Rating (Normalized)")) and len(eligible) > 2:
-            a, b = random.sample(eligible, 2)
-        ask_higher = random.choice([True, False])
-        ra = to_number(a.get("Rating (Normalized)")) or 0
-        rb = to_number(b.get("Rating (Normalized)")) or 0
-        answer_row = a if (ra > rb) == ask_higher else b
-        answer = clean_text(answer_row["Name"])
-        prompt_word = "higher" if ask_higher else "lower"
-        options = [clean_text(a["Name"]), clean_text(b["Name"])]
-        return Question(
-            prompt=f"Which did you rate **{prompt_word}**?",
-            options=options,
-            answer=answer,
-            explanation=f"You rated *{clean_text(a['Name'])}* {ra:g}/4 and *{clean_text(b['Name'])}* {rb:g}/4.",
-            source_title=answer,
-            source_author=clean_text(answer_row["Author"]),
-            mode=mode,
-        )
-
-    return None
-
-
-def book_explanation(row: dict) -> str:
-    title = clean_text(row.get("Name"))
-    author = clean_text(row.get("Author"))
-    bits = [f"*{title}* is by **{author}**."]
-
-    year_read = clean_text(row.get("Year Read"))
-    date_read = clean_text(row.get("Date Read"))
-    year_pub = clean_text(row.get("Year Published"))
-    rating = clean_text(row.get("Rating (Normalized)"))
-    genre = clean_text(row.get("Genre (Simple)"))
-    summary = clean_text(row.get("Summary (AI)"))
-
-    details = []
-    if date_read:
-        details.append(f"read {date_read}")
-    elif year_read:
-        details.append(f"read in {year_read}")
-    if year_pub:
-        details.append(f"published {year_pub}")
-    if genre:
-        details.append(genre)
-    if rating:
-        details.append(f"rated {rating}/4")
-    if details:
-        bits.append("Details: " + "; ".join(details) + ".")
-    if summary:
-        bits.append("**Spreadsheet summary:** " + summary)
-
-    note_parts = []
-    for label, col in [
-        ("At-the-time note", "Quick Summary/Notes (written at the time)"),
-        ("Later note", "Notes (written much later)"),
-        ("Favorite stories", "Favorite Stories"),
-        ("Awards", "Awards"),
-        ("Ownership", "Own a copy?"),
-    ]:
-        value = clean_text(row.get(col))
-        if value:
-            note_parts.append(f"- **{label}:** {value}")
-    if note_parts:
-        bits.append("**Your notes:**\n" + "\n".join(note_parts))
-    return "\n\n".join(bits)
-
-
-def http_json(url: str, timeout: int = 8) -> dict | None:
-    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+def append_history(row: dict) -> None:
+    clean_row = {column: row.get(column, "") for column in HISTORY_COLUMNS}
+    st.session_state.session_results.append(clean_row)
     try:
-        with urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError):
-        return None
-
-
-def first_sentences(text: str, max_sentences: int = 2, max_chars: int = 450) -> str:
-    text = re.sub(r"\s+", " ", clean_text(text))
-    if not text:
-        return ""
-    pieces = re.split(r"(?<=[.!?])\s+", text)
-    out = " ".join(pieces[:max_sentences]).strip()
-    if len(out) > max_chars:
-        out = out[:max_chars].rsplit(" ", 1)[0].rstrip() + "…"
-    return out
-
-
-def wikipedia_search_title(query: str) -> str:
-    if not clean_text(query):
-        return ""
-    url = (
-        f"{WIKIPEDIA_API}?action=query&list=search&format=json"
-        f"&srlimit=1&srsearch={quote(query)}"
-    )
-    data = http_json(url)
-    try:
-        return clean_text(data["query"]["search"][0]["title"]) if data else ""
-    except (KeyError, IndexError, TypeError):
-        return ""
-
-
-def wikipedia_summary_for_query(query: str) -> dict:
-    page_title = wikipedia_search_title(query)
-    if not page_title:
-        return {}
-    data = http_json(WIKIPEDIA_SUMMARY + quote(page_title.replace(" ", "_")))
-    if not data:
-        return {}
-    extract = first_sentences(clean_text(data.get("extract")))
-    url = clean_text(data.get("content_urls", {}).get("desktop", {}).get("page"))
-    title = clean_text(data.get("title")) or page_title
-    if not extract:
-        return {}
-    return {"title": title, "extract": extract, "url": url}
-
-
-def web_facts_markdown(title: str, author: str) -> str:
-    """Fetch fresh contextual facts after each answered question.
-
-    Uses Wikipedia's public APIs because they do not require API keys on Streamlit Cloud.
-    Results are best-effort; obscure books may return author-only or no result.
-    """
-    book_queries = [
-        f'"{title}" "{author}" book',
-        f'{title} {author} novel OR book',
-        f'{title} book',
-    ]
-    author_query = f'"{author}" writer author'
-
-    book_fact = {}
-    for query in book_queries:
-        book_fact = wikipedia_summary_for_query(query)
-        if book_fact:
-            break
-    author_fact = wikipedia_summary_for_query(author_query)
-
-    lines = []
-    if book_fact:
-        src = f" ([source]({book_fact['url']}))" if book_fact.get("url") else ""
-        lines.append(f"- **About the book/work:** {book_fact['extract']}{src}")
-    if author_fact and normalize_answer(author_fact.get("title")) != normalize_answer(book_fact.get("title", "")):
-        src = f" ([source]({author_fact['url']}))" if author_fact.get("url") else ""
-        lines.append(f"- **About the author:** {author_fact['extract']}{src}")
-
-    if not lines:
-        return "I could not find a reliable quick web fact for this one. This can happen with obscure titles, short fiction, or ambiguous titles."
-    return "\n".join(lines)
-
-
-def log_answer(question: Question, choice: str, correct: bool) -> None:
-    row = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "mode": question.mode,
-        "title": question.source_title,
-        "author": question.source_author,
-        "choice": choice,
-        "answer": question.answer,
-        "correct": correct,
-    }
-    history = pd.DataFrame([row])
-    try:
+        frame = pd.DataFrame([clean_row], columns=HISTORY_COLUMNS)
         if HISTORY_FILE.exists():
-            history.to_csv(HISTORY_FILE, mode="a", index=False, header=False)
+            frame.to_csv(HISTORY_FILE, mode="a", index=False, header=False)
         else:
-            history.to_csv(HISTORY_FILE, index=False)
+            frame.to_csv(HISTORY_FILE, index=False)
     except OSError:
-        # Hosted apps may have temporary or read-only storage; session tracking still works.
+        # Streamlit Community Cloud storage can be temporary. Part 6 will replace
+        # this with durable storage; the current session still retains the result.
         pass
 
 
 def history_df() -> pd.DataFrame:
     if not HISTORY_FILE.exists():
-        return pd.DataFrame()
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
     try:
-        return pd.read_csv(HISTORY_FILE)
+        hist = pd.read_csv(HISTORY_FILE)
+        for col in ["result_score", "points_awarded", "max_points", "response_seconds"]:
+            if col in hist.columns:
+                hist[col] = pd.to_numeric(hist[col], errors="coerce")
+        return hist
     except Exception:
-        return pd.DataFrame()
-
-
-def bool_series(values: pd.Series) -> pd.Series:
-    """Handle booleans read back from CSV as True/False or strings."""
-    return values.map(lambda x: str(x).strip().lower() in {"true", "1", "yes"})
-
-
-def cumulative_stats() -> tuple[int, int, float]:
-    hist = history_df()
-    if hist.empty or "correct" not in hist.columns:
-        return 0, 0, 0.0
-    attempts = len(hist)
-    score = int(bool_series(hist["correct"]).sum())
-    accuracy = (score / attempts * 100) if attempts else 0.0
-    return score, attempts, accuracy
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
 
 
 def reset_saved_history() -> None:
@@ -510,269 +185,728 @@ def reset_saved_history() -> None:
         pass
 
 
-def sidebar_filters(df: pd.DataFrame) -> dict:
-    with st.sidebar:
-        st.header("Quiz setup")
-        exclude_dnf = st.checkbox("Exclude likely DNF entries", value=True)
+def combined_history() -> pd.DataFrame:
+    saved = history_df()
+    session = pd.DataFrame(st.session_state.session_results, columns=HISTORY_COLUMNS)
+    if saved.empty:
+        return session
+    if session.empty:
+        return saved
+    combined = pd.concat([saved, session], ignore_index=True)
+    dedupe_cols = ["timestamp", "round_id", "stage", "subtype", "user_answer"]
+    return combined.drop_duplicates(subset=dedupe_cols, keep="last").reset_index(drop=True)
 
-        min_rating = None
-        if "Rating (Normalized)" in df.columns:
-            enable_min = st.checkbox("Filter by minimum rating", value=False)
-            if enable_min:
-                min_rating = st.slider("Minimum normalized rating", 0.0, 5.0, 3.0, 0.1)
 
-        genres = []
-        if "Genre (Simple)" in df.columns:
-            genres = st.multiselect("Genre", unique_nonempty(df["Genre (Simple)"]))
+def skill_stats(hist: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for skill in SKILL_ORDER:
+        subset = hist[hist["skill"] == skill] if not hist.empty and "skill" in hist.columns else pd.DataFrame()
+        attempts = len(subset)
+        recall = float(subset["result_score"].mean() * 100) if attempts else 0.0
+        unaided = subset[subset["assistance"] == "unaided"] if attempts and "assistance" in subset.columns else pd.DataFrame()
+        unaided_attempts = len(unaided)
+        unaided_recall = float(unaided["result_score"].mean() * 100) if unaided_attempts else 0.0
+        rows.append(
+            {
+                "Skill": skill,
+                "Attempts": attempts,
+                "Recall": f"{recall:.0f}%" if attempts else "—",
+                "Unaided attempts": unaided_attempts,
+                "Unaided recall": f"{unaided_recall:.0f}%" if unaided_attempts else "—",
+            }
+        )
+    return pd.DataFrame(rows)
 
-        types = []
-        if "Type" in df.columns:
-            types = st.multiselect("Type", unique_nonempty(df["Type"]))
 
-        authors = []
-        if "Author" in df.columns:
-            authors = st.multiselect("Author", unique_nonempty(df["Author"]), max_selections=20)
+def log_question_result(
+    round_obj: QuizRound,
+    *,
+    stage: str,
+    skill: str,
+    subtype: str,
+    question: str,
+    answer_mode: str,
+    assistance: str,
+    user_answer: str,
+    correct_answer: str,
+    result_score: float,
+    points_awarded: float,
+    max_points: float,
+    started_at: float,
+) -> None:
+    append_history(
+        {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "round_id": round_obj.round_id,
+            "book_key": round_obj.book_key,
+            "title": round_obj.title,
+            "author": round_obj.author,
+            "stage": stage,
+            "skill": skill,
+            "subtype": subtype,
+            "question": re.sub(r"\s+", " ", question).strip(),
+            "answer_mode": answer_mode,
+            "assistance": assistance,
+            "user_answer": user_answer,
+            "correct_answer": correct_answer,
+            "result_score": result_score,
+            "points_awarded": points_awarded,
+            "max_points": max_points,
+            "response_seconds": round(max(0.0, time.time() - started_at), 1),
+        }
+    )
 
-        year_read_values = []
-        if "Year Read" in df.columns:
-            year_read_values = st.multiselect("Year read", unique_nonempty(df["Year Read"]))
 
+# ---------------------------------------------------------------------------
+# Live web facts (fallback until Part 5 supplies curated facts)
+# ---------------------------------------------------------------------------
+
+def http_json(url: str, timeout: int = 8) -> dict | None:
+    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+
+
+def first_sentences(text: str, max_sentences: int = 2, max_chars: int = 430) -> str:
+    text = re.sub(r"\s+", " ", clean_text(text))
+    if not text:
+        return ""
+    pieces = re.split(r"(?<=[.!?])\s+", text)
+    output = " ".join(pieces[:max_sentences]).strip()
+    if len(output) > max_chars:
+        output = output[:max_chars].rsplit(" ", 1)[0].rstrip() + "…"
+    return output
+
+
+def wikipedia_search_title(query: str) -> str:
+    url = f"{WIKIPEDIA_API}?action=query&list=search&format=json&srlimit=1&srsearch={quote(query)}"
+    data = http_json(url)
+    try:
+        return clean_text(data["query"]["search"][0]["title"]) if data else ""
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def wikipedia_summary(query: str) -> dict:
+    page_title = wikipedia_search_title(query)
+    if not page_title:
+        return {}
+    data = http_json(WIKIPEDIA_SUMMARY + quote(page_title.replace(" ", "_")))
+    if not data:
+        return {}
+    extract = first_sentences(clean_text(data.get("extract")))
+    if not extract:
+        return {}
     return {
-        "exclude_dnf": exclude_dnf,
-        "genres": genres,
-        "types": types,
-        "authors": authors,
-        "min_rating": min_rating,
-        "year_read_values": year_read_values,
+        "title": clean_text(data.get("title")) or page_title,
+        "extract": extract,
+        "url": clean_text(data.get("content_urls", {}).get("desktop", {}).get("page")),
     }
 
 
-def reset_quiz_state() -> None:
-    for key in ["question", "answered", "last_choice", "mode_for_question", "show_options", "typed_answer"]:
-        st.session_state.pop(key, None)
+@st.cache_data(show_spinner=False, ttl=86400)
+def web_facts_markdown(title: str, author: str) -> str:
+    book_fact = {}
+    for query in [f'"{title}" "{author}" book', f"{title} {author} novel book", f'"{title}" book']:
+        book_fact = wikipedia_summary(query)
+        if book_fact:
+            break
+    author_fact = wikipedia_summary(f'"{author}" writer author')
+    lines = []
+    if book_fact:
+        source = f" ([source]({book_fact['url']}))" if book_fact.get("url") else ""
+        lines.append(f"- **About the book:** {book_fact['extract']}{source}")
+    if author_fact and normalize_answer(author_fact.get("title")) != normalize_answer(book_fact.get("title", "")):
+        source = f" ([source]({author_fact['url']}))" if author_fact.get("url") else ""
+        lines.append(f"- **About the author:** {author_fact['extract']}{source}")
+    return "\n".join(lines) if lines else "No reliable quick web fact was found for this title."
 
 
-def next_question(df: pd.DataFrame, mode: str) -> None:
-    st.session_state.question = make_question(df, mode)
-    st.session_state.mode_for_question = mode
-    st.session_state.answered = False
-    st.session_state.last_choice = None
-    st.session_state.show_options = False
-    st.session_state.typed_answer = ""
+# ---------------------------------------------------------------------------
+# Session and round state
+# ---------------------------------------------------------------------------
 
+def initialize_session() -> None:
+    defaults = {
+        "session_results": [],
+        "round_obj": None,
+        "stage": "identify",
+        "opening_attempts": 0,
+        "hints_used": 0,
+        "opening_show_mc": False,
+        "opening_resolved": False,
+        "opening_feedback": "",
+        "opening_started_at": time.time(),
+        "followup_index": 0,
+        "followup_attempts": 0,
+        "followup_show_mc": False,
+        "followup_revealed": False,
+        "followup_completed": False,
+        "followup_feedback": "",
+        "followup_user_answer": "",
+        "followup_started_at": time.time(),
+        "last_book_key": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def reset_followup_state() -> None:
+    st.session_state.followup_attempts = 0
+    st.session_state.followup_show_mc = False
+    st.session_state.followup_revealed = False
+    st.session_state.followup_completed = False
+    st.session_state.followup_feedback = ""
+    st.session_state.followup_user_answer = ""
+    st.session_state.followup_started_at = time.time()
+
+
+def start_new_round(books: list[dict], facts_by_key: dict[str, dict], target_mix: str, difficulty: str) -> None:
+    new_round = build_round(
+        books,
+        facts_by_key,
+        target_mix=target_mix,
+        difficulty=difficulty,
+        avoid_book_key=st.session_state.get("last_book_key"),
+    )
+    st.session_state.round_obj = new_round
+    st.session_state.last_book_key = new_round.book_key
+    st.session_state.stage = "identify"
+    st.session_state.opening_attempts = 0
+    st.session_state.hints_used = 0
+    st.session_state.opening_show_mc = False
+    st.session_state.opening_resolved = False
+    st.session_state.opening_feedback = ""
+    st.session_state.opening_started_at = time.time()
+    st.session_state.followup_index = 0
+    reset_followup_state()
+
+
+def resolve_opening(
+    round_obj: QuizRound,
+    *,
+    user_answer: str,
+    result_score: float,
+    points: float,
+    answer_mode: str,
+    assistance: str,
+    feedback: str,
+) -> None:
+    if st.session_state.opening_resolved:
+        return
+    st.session_state.opening_resolved = True
+    st.session_state.opening_feedback = feedback
+    log_question_result(
+        round_obj,
+        stage="opening",
+        skill=opening_skill(round_obj),
+        subtype="identify_title" if round_obj.target == "title" else "identify_author",
+        question=round_obj.opening_prompt,
+        answer_mode=answer_mode,
+        assistance=assistance,
+        user_answer=user_answer,
+        correct_answer=round_obj.opening_answer,
+        result_score=result_score,
+        points_awarded=points,
+        max_points=3.0,
+        started_at=st.session_state.opening_started_at,
+    )
+
+
+def resolve_followup(
+    round_obj: QuizRound,
+    question: FollowUpQuestion,
+    *,
+    user_answer: str,
+    result_score: float,
+    points: float,
+    answer_mode: str,
+    assistance: str,
+    feedback: str,
+) -> None:
+    if st.session_state.followup_completed:
+        return
+    st.session_state.followup_completed = True
+    st.session_state.followup_feedback = feedback
+    st.session_state.followup_user_answer = user_answer
+    log_question_result(
+        round_obj,
+        stage="followup",
+        skill=question.skill,
+        subtype=question.subtype,
+        question=question.prompt,
+        answer_mode=answer_mode,
+        assistance=assistance,
+        user_answer=user_answer,
+        correct_answer=question.answer,
+        result_score=result_score,
+        points_awarded=points,
+        max_points=question.max_points,
+        started_at=st.session_state.followup_started_at,
+    )
+
+
+# ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
+
+def current_points() -> tuple[float, float]:
+    session = pd.DataFrame(st.session_state.session_results)
+    if session.empty:
+        return 0.0, 0.0
+    return float(pd.to_numeric(session["points_awarded"], errors="coerce").fillna(0).sum()), float(
+        pd.to_numeric(session["max_points"], errors="coerce").fillna(0).sum()
+    )
+
+
+def render_opening(round_obj: QuizRound) -> None:
+    st.progress(0.05, text="Opening identification")
+    st.markdown('<div class="question-card">', unsafe_allow_html=True)
+    st.markdown(round_obj.opening_prompt)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if st.session_state.opening_feedback and not st.session_state.opening_resolved:
+        st.warning(st.session_state.opening_feedback)
+
+    if not st.session_state.opening_resolved:
+        with st.form(key=f"opening_form_{round_obj.round_id}_{st.session_state.opening_attempts}"):
+            answer = st.text_input("Write your answer", placeholder="Take a guess — getting it wrong is fine.")
+            submitted = st.form_submit_button("Submit answer", type="primary", use_container_width=True)
+        if submitted:
+            if not clean_text(answer):
+                st.warning("Type an answer, request a hint, or use multiple choice.")
+            elif answer_matches(answer, round_obj.opening_aliases):
+                attempts = st.session_state.opening_attempts
+                hints = st.session_state.hints_used
+                if st.session_state.opening_show_mc:
+                    points, assistance = 1.0, "multiple_choice"
+                elif hints >= 2:
+                    points, assistance = 1.0, "hint_2"
+                elif hints == 1:
+                    points, assistance = 2.0, "hint_1"
+                elif attempts >= 1:
+                    points, assistance = 2.0, "retry"
+                else:
+                    points, assistance = 3.0, "unaided"
+                resolve_opening(
+                    round_obj,
+                    user_answer=answer,
+                    result_score=1.0,
+                    points=points,
+                    answer_mode="typed",
+                    assistance=assistance,
+                    feedback="Correct.",
+                )
+                st.rerun()
+            else:
+                st.session_state.opening_attempts += 1
+                st.session_state.opening_feedback = "Not quite. Try again, ask for a hint, or switch to multiple choice."
+                st.rerun()
+
+        for idx in range(st.session_state.hints_used):
+            if idx < len(round_obj.hints):
+                st.info(f"**Hint {idx + 1}:** {round_obj.hints[idx]}")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.session_state.hints_used < len(round_obj.hints):
+                if st.button("Give me a hint", use_container_width=True):
+                    st.session_state.hints_used += 1
+                    st.rerun()
+        with col2:
+            if not st.session_state.opening_show_mc:
+                if st.button("Show multiple choice", use_container_width=True):
+                    st.session_state.opening_show_mc = True
+                    st.rerun()
+
+        if st.session_state.opening_show_mc:
+            st.markdown("#### Multiple choice")
+            for index, option in enumerate(round_obj.options):
+                if st.button(option, key=f"opening_option_{round_obj.round_id}_{index}", use_container_width=True):
+                    correct = normalize_answer(option) == normalize_answer(round_obj.opening_answer)
+                    resolve_opening(
+                        round_obj,
+                        user_answer=option,
+                        result_score=1.0 if correct else 0.0,
+                        points=1.0 if correct else 0.0,
+                        answer_mode="choice",
+                        assistance="multiple_choice",
+                        feedback="Correct." if correct else f"Not quite. The answer is {round_obj.opening_answer}.",
+                    )
+                    st.rerun()
+
+        if st.button("Reveal the answer", use_container_width=True):
+            resolve_opening(
+                round_obj,
+                user_answer="",
+                result_score=0.0,
+                points=0.0,
+                answer_mode="revealed",
+                assistance="revealed",
+                feedback=f"The answer is {round_obj.opening_answer}.",
+            )
+            st.rerun()
+
+    else:
+        if "Correct" in st.session_state.opening_feedback:
+            st.success(st.session_state.opening_feedback)
+        else:
+            st.info(st.session_state.opening_feedback)
+        st.markdown(f"### *{round_obj.title}* — {round_obj.author}")
+        if st.button("Continue with this book", type="primary", use_container_width=True):
+            st.session_state.stage = "followup"
+            reset_followup_state()
+            st.rerun()
+
+
+def auto_question_assistance() -> str:
+    if st.session_state.followup_show_mc:
+        return "multiple_choice"
+    if st.session_state.followup_attempts:
+        return "retry"
+    return "unaided"
+
+
+def render_auto_followup(round_obj: QuizRound, question: FollowUpQuestion) -> None:
+    if st.session_state.followup_feedback and not st.session_state.followup_completed:
+        st.warning(st.session_state.followup_feedback)
+
+    if not st.session_state.followup_completed:
+        with st.form(key=f"followup_form_{question.question_id}_{st.session_state.followup_attempts}"):
+            answer = st.text_input("Your answer", placeholder="Take your best shot.")
+            submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+        if submitted:
+            accepted = question.acceptable_answers or [question.answer]
+            if not clean_text(answer):
+                st.warning("Type an answer or use one of the help options.")
+            elif answer_matches(answer, accepted):
+                assistance = auto_question_assistance()
+                points = 0.5 if assistance == "multiple_choice" else (0.75 if assistance == "retry" else 1.0)
+                resolve_followup(
+                    round_obj,
+                    question,
+                    user_answer=answer,
+                    result_score=1.0,
+                    points=points,
+                    answer_mode="typed",
+                    assistance=assistance,
+                    feedback="Correct.",
+                )
+                st.rerun()
+            else:
+                st.session_state.followup_attempts += 1
+                st.session_state.followup_feedback = "Not quite. Try again, show choices, or reveal the answer."
+                st.rerun()
+
+        if question.options and not st.session_state.followup_show_mc:
+            if st.button("I'm not sure — show choices", use_container_width=True):
+                st.session_state.followup_show_mc = True
+                st.rerun()
+
+        if st.session_state.followup_show_mc and question.options:
+            for index, option in enumerate(question.options):
+                if st.button(option, key=f"followup_option_{question.question_id}_{index}", use_container_width=True):
+                    accepted = question.acceptable_answers or [question.answer]
+                    correct = answer_matches(option, accepted)
+                    resolve_followup(
+                        round_obj,
+                        question,
+                        user_answer=option,
+                        result_score=1.0 if correct else 0.0,
+                        points=0.5 if correct else 0.0,
+                        answer_mode="choice",
+                        assistance="multiple_choice",
+                        feedback="Correct." if correct else "Not quite.",
+                    )
+                    st.rerun()
+
+        if st.button("Reveal answer", use_container_width=True):
+            resolve_followup(
+                round_obj,
+                question,
+                user_answer="",
+                result_score=0.0,
+                points=0.0,
+                answer_mode="revealed",
+                assistance="revealed",
+                feedback="Answer revealed.",
+            )
+            st.rerun()
+
+
+def render_choice_followup(round_obj: QuizRound, question: FollowUpQuestion) -> None:
+    if not st.session_state.followup_completed:
+        for index, option in enumerate(question.options):
+            if st.button(option, key=f"choice_{question.question_id}_{index}", use_container_width=True):
+                correct = normalize_answer(option) == normalize_answer(question.answer)
+                resolve_followup(
+                    round_obj,
+                    question,
+                    user_answer=option,
+                    result_score=1.0 if correct else 0.0,
+                    points=1.0 if correct else 0.0,
+                    answer_mode="choice",
+                    assistance="built_in_choice",
+                    feedback="Correct." if correct else "Not quite.",
+                )
+                st.rerun()
+
+
+def render_self_followup(round_obj: QuizRound, question: FollowUpQuestion) -> None:
+    if st.session_state.followup_completed:
+        if st.session_state.followup_user_answer:
+            st.markdown("**Your answer:**")
+            st.markdown(f"> {st.session_state.followup_user_answer}")
+        st.markdown("**Prepared answer:**")
+        st.markdown(question.answer)
+        return
+    if not st.session_state.followup_revealed:
+        with st.form(key=f"self_form_{question.question_id}"):
+            answer = st.text_area(
+                "What do you remember?",
+                placeholder="A rough answer is enough. You will grade yourself after seeing the prepared answer.",
+                height=120,
+            )
+            submitted = st.form_submit_button("Show prepared answer", type="primary", use_container_width=True)
+        if submitted:
+            st.session_state.followup_user_answer = answer
+            st.session_state.followup_revealed = True
+            st.rerun()
+    else:
+        if st.session_state.followup_user_answer:
+            st.markdown("**Your answer:**")
+            st.markdown(f"> {st.session_state.followup_user_answer}")
+        else:
+            st.caption("You left your answer blank.")
+        st.markdown("**Prepared answer:**")
+        st.markdown(question.answer)
+        st.caption("Grade the substance of your recall, not whether your wording matched exactly.")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            remembered = st.button("Remembered", key=f"remembered_{question.question_id}", use_container_width=True)
+        with col2:
+            partial = st.button("Partial", key=f"partial_{question.question_id}", use_container_width=True)
+        with col3:
+            missed = st.button("Missed", key=f"missed_{question.question_id}", use_container_width=True)
+        if remembered or partial or missed:
+            if remembered:
+                score, label = 1.0, "Remembered."
+            elif partial:
+                score, label = 0.5, "Partially remembered."
+            else:
+                score, label = 0.0, "Missed."
+            resolve_followup(
+                round_obj,
+                question,
+                user_answer=st.session_state.followup_user_answer,
+                result_score=score,
+                points=score,
+                answer_mode="self_grade",
+                assistance="unaided",
+                feedback=label,
+            )
+            st.rerun()
+
+
+def render_followup(round_obj: QuizRound) -> None:
+    index = st.session_state.followup_index
+    if index >= len(round_obj.followups):
+        st.session_state.stage = "end"
+        st.rerun()
+        return
+
+    question = round_obj.followups[index]
+    progress = (index + 1) / (len(round_obj.followups) + 1)
+    st.progress(progress, text=f"Follow-up {index + 1} of {len(round_obj.followups)} · {question.skill}")
+    st.markdown('<div class="question-card">', unsafe_allow_html=True)
+    st.markdown(f"**{question.prompt}**")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if question.spoiler:
+        st.warning("This follow-up contains a spoiler.")
+
+    if question.grading == "self":
+        render_self_followup(round_obj, question)
+    elif question.grading == "choice":
+        render_choice_followup(round_obj, question)
+    else:
+        render_auto_followup(round_obj, question)
+
+    if st.session_state.followup_completed:
+        if st.session_state.followup_feedback.startswith("Correct") or st.session_state.followup_feedback.startswith("Remembered"):
+            st.success(st.session_state.followup_feedback)
+        elif st.session_state.followup_feedback.startswith("Partially"):
+            st.warning(st.session_state.followup_feedback)
+        else:
+            st.info(st.session_state.followup_feedback)
+        st.markdown(question.explanation)
+        if question.grading != "self" or not st.session_state.followup_revealed:
+            st.markdown(f"**Answer:** {question.answer}")
+        button_label = "Finish round" if index + 1 >= len(round_obj.followups) else "Next follow-up"
+        if st.button(button_label, type="primary", use_container_width=True):
+            st.session_state.followup_index += 1
+            if st.session_state.followup_index >= len(round_obj.followups):
+                st.session_state.stage = "end"
+            reset_followup_state()
+            st.rerun()
+
+
+def render_round_end(round_obj: QuizRound, books: list[dict], facts_by_key: dict[str, dict], target_mix: str, difficulty: str) -> None:
+    st.progress(1.0, text="Round complete")
+    st.success("Round complete.")
+    st.markdown(book_notes_markdown(round_obj))
+
+    st.markdown("### Fun facts")
+    if round_obj.facts:
+        curated = [
+            clean_text(round_obj.facts.get("Fun Fact 1")),
+            clean_text(round_obj.facts.get("Fun Fact 2")),
+        ]
+        curated = [fact for fact in curated if fact]
+        if curated:
+            st.markdown("\n".join(f"- {fact}" for fact in curated))
+    with st.spinner("Checking for a couple of additional web facts..."):
+        st.markdown(web_facts_markdown(round_obj.title, round_obj.author))
+
+    if st.button("Start another round", type="primary", use_container_width=True):
+        start_new_round(books, facts_by_key, target_mix, difficulty)
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Main app
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    st.set_page_config(page_title="Maks Book Quiz", page_icon="📚", layout="centered")
+    st.set_page_config(page_title="Maks Book Memory Quiz", page_icon="📚", layout="centered")
     st.markdown(MOBILE_CSS, unsafe_allow_html=True)
-    st.title("📚 Maks Book Quiz")
-    st.caption("A phone-friendly quiz for your reading database.")
+    initialize_session()
 
-    for key, default in [("score", 0), ("attempts", 0), ("missed", [])]:
-        if key not in st.session_state:
-            st.session_state[key] = default
+    st.title("📚 Maks Book Memory Quiz")
+    st.caption("Identify a book or author, then stay with the same book for plot, personal-memory, and connection questions.")
 
     with st.sidebar:
         st.header("Booklist")
-        uploaded = st.file_uploader("Upload newer booklist .xlsx", type=["xlsx"])
-        st.caption("Without an upload, the bundled workbook is used.")
-
-    source = uploaded if uploaded is not None else DEFAULT_WORKBOOK
-
-    if not DEFAULT_WORKBOOK.exists() and uploaded is None:
-        st.error("No bundled workbook found. Upload your booklist .xlsx in the sidebar.")
-        return
+        uploaded = st.file_uploader("Upload a newer .xlsx booklist", type=["xlsx"])
+        st.caption("The app uses only the Book List sheet. DNF entries and individual short stories are excluded.")
 
     try:
-        sheets = sheet_names(source)
+        if uploaded is not None:
+            raw_books, raw_facts = load_workbook_bytes(uploaded.getvalue())
+        else:
+            if not DEFAULT_WORKBOOK.exists():
+                st.error("Bundled workbook is missing. Upload your booklist in the sidebar.")
+                return
+            raw_books, raw_facts = load_workbook_path(str(DEFAULT_WORKBOOK))
+        prepared_rows = prepare_book_rows(raw_books)
+        facts_by_key = prepare_facts(raw_facts)
     except Exception as exc:
-        st.error(f"Could not read workbook: {exc}")
+        st.error(f"Could not load the workbook: {exc}")
         return
 
-    preferred = [s for s in ["Book List", "Short Fiction"] if s in sheets]
-    sheet_options = preferred or sheets
     with st.sidebar:
-        sheet = st.selectbox("Sheet", sheet_options)
+        st.header("Quiz setup")
+        genre_options = sorted(unique_nonempty(prepared_rows[GENRE_COL])) if GENRE_COL in prepared_rows.columns else []
+        genres = st.multiselect("Genre", genre_options)
+        author_options = sorted(unique_nonempty(prepared_rows[AUTHOR_COL]))
+        authors = st.multiselect("Author", author_options, max_selections=20)
+        year_options = sorted(unique_nonempty(prepared_rows[YEAR_READ_COL])) if YEAR_READ_COL in prepared_rows.columns else []
+        years_read = st.multiselect("Year read", year_options)
+        min_rating = None
+        if RATING_COL in prepared_rows.columns and st.checkbox("Use a minimum rating", value=False):
+            min_rating = st.slider("Minimum rating", 0.0, 4.0, 2.5, 0.25)
 
-    try:
-        raw_df = load_workbook(source, sheet)
-    except Exception as exc:
-        st.error(f"Could not load sheet: {exc}")
-        return
+        target_mix = st.selectbox("Opening target", ["Mostly titles", "Balanced", "Only titles", "Only authors"])
+        difficulty = st.selectbox("Opening difficulty", ["Challenging", "Mixed", "Easier"])
 
-    if not has_required_columns(raw_df):
-        st.error("This sheet needs at least `Name` and `Author` columns.")
-        st.write("Columns found:", list(raw_df.columns))
-        return
-
-    filters = sidebar_filters(raw_df)
-    df = filter_books(raw_df, **filters)
+    filtered_rows = filter_rows(
+        prepared_rows,
+        genres=genres,
+        authors=authors,
+        years_read=years_read,
+        min_rating=min_rating,
+    )
+    books = group_books(filtered_rows)
 
     with st.sidebar:
         st.divider()
-        mode = st.selectbox("Quiz mode", QUIZ_MODES)
-        if st.button("New question", use_container_width=True):
-            next_question(df, mode)
-        if st.button("Reset cumulative score", use_container_width=True):
+        if st.button("New round", type="primary", use_container_width=True, disabled=not books):
+            start_new_round(books, facts_by_key, target_mix, difficulty)
+            st.rerun()
+        if st.button("Reset current session", use_container_width=True):
+            st.session_state.session_results = []
+            st.session_state.round_obj = None
+            st.rerun()
+        if st.button("Reset saved statistics", use_container_width=True):
             reset_saved_history()
-            st.session_state.score = 0
-            st.session_state.attempts = 0
-            st.session_state.missed = []
-            reset_quiz_state()
+            st.session_state.session_results = []
+            st.session_state.round_obj = None
             st.rerun()
 
-    total = len(df)
-    st.info(f"Quiz pool: **{total}** entries from **{sheet}**.")
-    if total < 4:
-        st.warning("The current filters leave fewer than 4 entries. Loosen the filters to generate multiple-choice questions.")
+    if not books:
+        st.warning("No books remain under the current filters.")
         return
 
-    cumulative_score, cumulative_attempts, cumulative_accuracy = cumulative_stats()
+    signature = pool_signature(books, target_mix, difficulty)
+    if st.session_state.get("pool_signature") != signature:
+        st.session_state.pool_signature = signature
+        start_new_round(books, facts_by_key, target_mix, difficulty)
+
+    round_obj: QuizRound = st.session_state.round_obj
+
+    session_points, session_max = current_points()
+    hist = combined_history()
+    total_points = float(hist["points_awarded"].sum()) if not hist.empty else 0.0
+    total_max = float(hist["max_points"].sum()) if not hist.empty else 0.0
+    total_recall = float(hist["result_score"].mean() * 100) if not hist.empty else 0.0
 
     col1, col2, col3 = st.columns(3)
-    col1.metric("Cumulative score", cumulative_score)
-    col2.metric("Cumulative attempts", cumulative_attempts)
-    col3.metric("Cumulative accuracy", f"{cumulative_accuracy:.0f}%")
+    col1.metric("Session points", f"{session_points:g}/{session_max:g}")
+    col2.metric("Cumulative points", f"{total_points:g}/{total_max:g}")
+    col3.metric("Recall", f"{total_recall:.0f}%" if not hist.empty else "—")
+    st.caption(f"Current quiz pool: **{len(books)} books**. This Part 4 version saves detailed history to a server file; durable cross-device storage comes in Part 6.")
 
-    if cumulative_attempts:
-        st.caption("Cumulative score is saved to the app's quiz-history file and should survive closing/reopening the app. On Streamlit Cloud, it may still reset if the hosted app is rebuilt or restarted.")
+    if st.session_state.stage == "identify":
+        render_opening(round_obj)
+    elif st.session_state.stage == "followup":
+        render_followup(round_obj)
+    else:
+        render_round_end(round_obj, books, facts_by_key, target_mix, difficulty)
 
-    if (
-        "question" not in st.session_state
-        or st.session_state.question is None
-        or st.session_state.get("mode_for_question") != mode
-    ):
-        next_question(df, mode)
+    with st.expander("Skill statistics"):
+        st.caption("Each question is stored separately, so title, author, plot, character, theme, and personal-memory performance can diverge.")
+        st.dataframe(skill_stats(hist), hide_index=True, use_container_width=True)
+        if not facts_by_key:
+            st.info("Character and theme rows will begin filling after Part 5 adds the curated Quiz Facts sheet.")
 
-    question: Question | None = st.session_state.question
-    if question is None:
-        st.warning("Could not make a question for this mode. Try a different mode or loosen filters.")
-        return
-
-    st.markdown('<div class="question-card">', unsafe_allow_html=True)
-    st.subheader("Question")
-    st.markdown(question.prompt)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    disabled = st.session_state.get("answered", False)
-
-    if not disabled:
-        with st.form(key=f"typed_answer_form_{question.mode}_{question.source_title}_{question.source_author}"):
-            typed_answer = st.text_input("Write your answer", value=st.session_state.get("typed_answer", ""))
-            submitted = st.form_submit_button("Check answer", type="primary", use_container_width=True)
-
-        if submitted:
-            if not clean_text(typed_answer):
-                st.warning("Type an answer, or use the multiple-choice button if you are not sure.")
-            else:
-                correct = answers_match(typed_answer, question.answer)
-                st.session_state.answered = True
-                st.session_state.last_choice = typed_answer
-                st.session_state.typed_answer = typed_answer
-                st.session_state.attempts += 1
-                if correct:
-                    st.session_state.score += 1
-                else:
-                    st.session_state.missed.append(
-                        {
-                            "mode": question.mode,
-                            "title": question.source_title,
-                            "author": question.source_author,
-                            "your_answer": typed_answer,
-                            "correct_answer": question.answer,
-                        }
-                    )
-                log_answer(question, typed_answer, correct)
-                st.rerun()
-
-        if not st.session_state.get("show_options", False):
-            if st.button("I'm not sure — show multiple choice options", use_container_width=True):
-                st.session_state.show_options = True
-                st.rerun()
-
-    if st.session_state.get("show_options", False) and not disabled:
-        st.markdown("#### Multiple choice")
-        for i, option in enumerate(question.options):
-            if st.button(option, key=f"option_{i}_{option}", use_container_width=True):
-                correct = option == question.answer
-                st.session_state.answered = True
-                st.session_state.last_choice = option
-                st.session_state.attempts += 1
-                if correct:
-                    st.session_state.score += 1
-                else:
-                    st.session_state.missed.append(
-                        {
-                            "mode": question.mode,
-                            "title": question.source_title,
-                            "author": question.source_author,
-                            "your_answer": option,
-                            "correct_answer": question.answer,
-                        }
-                    )
-                log_answer(question, option, correct)
-                st.rerun()
-
-    if st.session_state.get("answered", False):
-        choice = st.session_state.get("last_choice")
-        if answers_match(choice, question.answer):
-            st.success("Correct.")
-        else:
-            st.error(f"Not quite. Correct answer: **{question.answer}**")
-        st.markdown(question.explanation)
-
-        st.markdown("#### Web facts")
-        with st.spinner("Pulling a couple of fresh facts from the web..."):
-            st.markdown(web_facts_markdown(question.source_title, question.source_author))
-
-        if st.button("Next question", type="primary", use_container_width=True):
-            next_question(df, mode)
-            st.rerun()
-
-    with st.expander("Missed this session"):
-        if st.session_state.missed:
-            missed = pd.DataFrame(st.session_state.missed)
-            st.dataframe(missed, hide_index=True, use_container_width=True)
-            st.download_button(
-                "Download missed questions",
-                missed.to_csv(index=False).encode("utf-8"),
-                file_name="book_quiz_missed.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        else:
-            st.write("No misses yet.")
-
-    with st.expander("Saved quiz history"):
-        hist = history_df()
+    with st.expander("Recent results"):
         if hist.empty:
-            st.write("No saved history yet. On hosted Streamlit, saved history may reset when the app is rebuilt or restarted.")
+            st.write("No results yet.")
         else:
-            saved_score, saved_attempts, saved_accuracy = cumulative_stats()
-            st.write(f"Cumulative: **{saved_score}/{saved_attempts}** correct — **{saved_accuracy:.0f}%**.")
-            st.dataframe(hist.tail(50), hide_index=True, use_container_width=True)
+            columns = [
+                "timestamp",
+                "title",
+                "skill",
+                "assistance",
+                "result_score",
+                "points_awarded",
+            ]
+            st.dataframe(hist[columns].tail(50), hide_index=True, use_container_width=True)
             st.download_button(
-                "Download full history",
+                "Download detailed history",
                 hist.to_csv(index=False).encode("utf-8"),
-                file_name="book_quiz_history.csv",
+                file_name="book_memory_quiz_history.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
 
-    with st.expander("Browse current quiz pool"):
-        display_cols = [
-            c
-            for c in [
-                "Name",
-                "Author",
-                "Year Read",
-                "Year Published",
-                "Genre (Simple)",
-                "Type",
-                "Rating (Normalized)",
-            ]
-            if c in df.columns
-        ]
-        st.dataframe(df[display_cols], hide_index=True, use_container_width=True)
+    with st.expander("Browse current book pool"):
+        display_columns = [col for col in [TITLE_COL, AUTHOR_COL, YEAR_READ_COL, GENRE_COL, RATING_COL] if col in filtered_rows.columns]
+        st.dataframe(filtered_rows[display_columns], hide_index=True, use_container_width=True)
 
 
 if __name__ == "__main__":

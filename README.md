@@ -1,22 +1,59 @@
-# Maks Book Quiz
+# Maks Book Memory Quiz — Part 4 interactive shell
 
-A phone-friendly Streamlit web app that quizzes you on your reading database.
+This version replaces isolated flashcards with multi-step book rounds:
 
-## What it does
+1. Identify a book or author from a real clue.
+2. Type an answer first.
+3. Retry, request up to two progressively easier hints, use multiple choice, or reveal.
+4. Continue with the same book for author/title, plot, personal-memory, publication, series, and connection questions.
+5. End with workbook notes and fresh web facts.
 
-- Uses the bundled `Maks_Booklist_enriched_2026-04-25.xlsx` by default.
-- Lets you upload a newer `.xlsx` booklist from the sidebar.
-- Supports the `Book List` and `Short Fiction` sheets when present.
-- Excludes likely DNF rows by default.
-- Includes quiz modes for:
-  - Title → Author
-  - Author → Title
-  - Summary → Title
-  - Summary → Author
-  - Published earlier/later
-  - Your rating higher/lower
-- Tracks score and missed questions for the current session.
-- Lets you download missed questions/history as CSV.
+## Scope
+
+- Uses only the `Book List` sheet.
+- Excludes likely DNF entries.
+- Excludes individual rows whose `Type` is `Short Story`.
+- Keeps short-story collections and other books recorded as Book List entries.
+- Combines reread rows for book-knowledge questions while preserving each reading event in personal-memory questions.
+
+## Statistics
+
+Every answer records its own skill, including:
+
+- Book identification
+- Author identification
+- Characters
+- Plot
+- Themes
+- Personal reading memory
+- Publication knowledge
+- Connections
+
+The history also records whether the response was unaided, retried, hinted, multiple choice, self-graded, or revealed. The current version writes this to `.book_quiz_history_v2.csv` on the Streamlit server. Streamlit hosting can rebuild or reset that file; durable cross-device storage is planned for Part 6.
+
+## Preparing for Part 5
+
+The app already detects an optional `Quiz Facts` sheet and can use columns such as:
+
+- `Name`
+- `Author`
+- `Opening Clue Hard`
+- `Opening Clue Medium`
+- `Opening Clue Easy`
+- `Hint 1`
+- `Hint 2`
+- `Plot Question`
+- `Plot Answer`
+- `Character Question`
+- `Character Answer`
+- `Theme Question`
+- `Theme Answer`
+- `Fun Fact 1`
+- `Fun Fact 2`
+- `Source 1`
+- `Source 2`
+
+Part 5 will research and populate these fields. Without that sheet, the Part 4 app falls back to the existing AI summary, notes, ratings, dates, series, genre, and publication metadata.
 
 ## Run locally
 
@@ -27,25 +64,14 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Deploy to Streamlit Community Cloud
+## Update the deployed GitHub app
 
-1. Create a GitHub account if you do not already have one.
-2. Create a new GitHub repository, ideally private if you are bundling your personal booklist.
-3. Upload these files to the root of the repository:
-   - `app.py`
-   - `requirements.txt`
-   - `runtime.txt`
-   - `.streamlit/config.toml`
-   - `Maks_Booklist_enriched_2026-04-25.xlsx`
-4. Go to Streamlit Community Cloud.
-5. Create a new app from the GitHub repo.
-6. Set the main file path to `app.py`.
-7. Deploy.
+Upload/replace these files in the root of the GitHub repository:
 
-## Using it on iPhone
+- `app.py`
+- `quiz_engine.py` (new)
+- `requirements.txt`
+- `README.md`
+- `Maks_Booklist_enriched_2026-06-24_updated_notes_corrected.xlsx`
 
-After deployment, open the Streamlit URL in Safari. Use Share → Add to Home Screen to create an app-like icon.
-
-## Privacy note
-
-If the Excel file is committed to GitHub, it is stored with the repo. Use a private GitHub repository if you do not want the booklist public. Streamlit Community Cloud can deploy from GitHub repositories, including private repositories connected to your account.
+Remove the older bundled workbook or leave it unused. Streamlit should redeploy after the commit.
