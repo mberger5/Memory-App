@@ -556,8 +556,14 @@ def render_opening(round_obj: QuizRound) -> None:
             st.success(st.session_state.opening_feedback)
         else:
             st.info(st.session_state.opening_feedback)
-        st.markdown(f"### *{round_obj.title}* — {round_obj.author}")
-        if st.button("Continue with this book", type="primary", use_container_width=True):
+        st.markdown(f"### The book is *{round_obj.title}*")
+        st.caption(f"By {round_obj.author}")
+        if st.button(
+            "Continue with this book",
+            type="primary",
+            use_container_width=True,
+            key=f"continue_opening_{round_obj.round_id}",
+        ):
             st.session_state.stage = "followup"
             reset_followup_state()
             st.rerun()
@@ -747,7 +753,12 @@ def render_followup(round_obj: QuizRound) -> None:
         if question.grading != "self" or not st.session_state.followup_revealed:
             st.markdown(f"**Answer:** {question.answer}")
         button_label = "Finish round" if index + 1 >= len(round_obj.followups) else "Next follow-up"
-        if st.button(button_label, type="primary", use_container_width=True):
+        if st.button(
+            button_label,
+            type="primary",
+            use_container_width=True,
+            key=f"advance_{round_obj.round_id}_{question.question_id}",
+        ):
             st.session_state.followup_index += 1
             if st.session_state.followup_index >= len(round_obj.followups):
                 st.session_state.stage = "end"
@@ -787,7 +798,7 @@ def main() -> None:
     initialize_session()
 
     st.title("📚 Maks Book Memory Quiz")
-    st.caption("Identify a book or author, then stay with the same book for plot, personal-memory, and connection questions.")
+    st.caption("Identify the book title first, then stay with that book for author, plot, personal-memory, and connection questions.")
 
     with st.sidebar:
         st.header("Booklist")
@@ -820,7 +831,8 @@ def main() -> None:
         if RATING_COL in prepared_rows.columns and st.checkbox("Use a minimum rating", value=False):
             min_rating = st.slider("Minimum rating", 0.0, 4.0, 2.5, 0.25)
 
-        target_mix = st.selectbox("Opening target", ["Mostly titles", "Balanced", "Only titles", "Only authors"])
+        target_mix = "Only titles"
+        st.caption("Every round begins by identifying the book title. Author recall comes next.")
         difficulty = st.selectbox("Opening difficulty", ["Challenging", "Mixed", "Easier"])
 
     filtered_rows = filter_rows(

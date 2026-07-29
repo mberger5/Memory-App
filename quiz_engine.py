@@ -326,14 +326,10 @@ def fact_value(facts: dict, key: str) -> str:
 
 
 def choose_target(target_mix: str) -> str:
-    if target_mix == "Only titles":
-        return "title"
-    if target_mix == "Only authors":
-        return "author"
-    if target_mix == "Balanced":
-        return random.choice(["title", "author"])
-    # Default: title-heavy because plot/series clues naturally identify books.
-    return "title" if random.random() < 0.75 else "author"
+    # Every round begins by identifying the book title. Author recall is always
+    # tested only after the title has been identified or revealed. The argument
+    # remains for compatibility with older saved app state and history.
+    return "title"
 
 
 def select_opening_clue(book: dict, facts: dict, difficulty: str) -> str:
@@ -508,22 +504,52 @@ def build_counterpart_question(book: dict, opening_target: str, all_books: list[
     )
 
 
-def build_plot_question(book: dict, facts: dict) -> FollowUpQuestion:
+def build_plot_question(book: dict, facts: dict) -> FollowUpQuestion | None:
+    # A generic question based on Summary (AI) simply repeats the opening clue,
+    # so plot follow-ups are included only when Part 5 supplies a distinct,
+    # curated question and answer.
     custom_question = fact_value(facts, "plot_question")
     custom_answer = fact_value(facts, "plot_answer")
-    summary = clean_text(book.get(SUMMARY_COL))
-    prompt = custom_question or "Without looking back at the opening clue, what is the central subject, premise, or conflict of this book?"
-    answer = custom_answer or summary or "Use your own recollection of the main plot or conflict."
+    if not custom_question or not custom_answer:
+        return None
     return FollowUpQuestion(
         question_id=str(uuid.uuid4()),
         skill="Plot",
-        subtype="central_premise",
-        prompt=prompt,
-        answer=answer,
+        subtype="curated_plot",
+        prompt=custom_question,
+        answer=custom_answer,
         acceptable_answers=[],
         grading="self",
-        explanation="Compare your answer with the prepared plot summary, then grade your own recall.",
+        explanation="Compare your answer with the prepared plot answer, then grade your own recall.",
     )
+
+
+def meaningful_tokens(value: object) -> set[str]:
+    stopwords = {
+        "about", "after", "again", "against", "also", "another", "because",
+        "been", "before", "book", "central", "does", "from", "have", "into",
+        "major", "more", "most", "novel", "question", "story", "that", "their",
+        "theme", "themes", "there", "these", "they", "this", "through", "what",
+        "when", "where", "which", "while", "with", "without", "would",
+    }
+    return {
+        token
+        for token in normalize_answer(value).split()
+        if len(token) >= 4 and token not in stopwords
+    }
+
+
+def overlaps_opening(opening_clue: str, question: FollowUpQuestion) -> bool:
+    opening = meaningful_tokens(opening_clue)
+    if not opening:
+        return False
+    answer_tokens = meaningful_tokens(question.answer)
+    prompt_tokens = meaningful_tokens(question.prompt)
+    # Skip a follow-up when most of its substantive answer was already supplied
+    # in the opening clue, or when the question itself substantially repeats it.
+    answer_overlap = len(opening & answer_tokens) / max(1, len(answer_tokens))
+    prompt_overlap = len(opening & prompt_tokens) / max(1, len(prompt_tokens))
+    return answer_overlap >= 0.65 or prompt_overlap >= 0.75
 
 
 def build_curated_deep_questions(facts: dict) -> list[FollowUpQuestion]:
@@ -739,25 +765,29 @@ def build_round(
 
     title = clean_text(book.get(TITLE_COL))
     author = clean_text(book.get(AUTHOR_COL))
-    target = choose_target(target_mix)
+    target = "title"
     clue = select_opening_clue(book, facts, difficulty)
-    clue = redact_answer_terms(clue, title_aliases(title) + author_redaction_terms(author))
+    # The author may be part of a fair title clue; only the title itself must be
+    # hidden before identification.
+    clue = redact_answer_terms(clue, title_aliases(title))
 
-    if target == "title":
-        prompt = f"**Which book is this?**\n\n> {clue}"
-        answer = title
-        aliases = title_aliases(title)
-    else:
-        prompt = f"**Which author wrote the book described here?**\n\n> {clue}"
-        answer = author
-        aliases = author_aliases(author)
+    prompt = f"**Which book is this?**\n\n> {clue}"
+    answer = title
+    aliases = title_aliases(title)
 
     hints = build_hints(book, facts, target, books)
     options = build_options(current, books, target)
 
+    # Title is always identified first; author is always the first follow-up.
     followups: list[FollowUpQuestion] = [build_counterpart_question(book, target, books)]
-    followups.append(build_plot_question(book, facts))
-    followups.extend(build_curated_deep_questions(facts))
+
+    deep_questions: list[FollowUpQuestion] = []
+    plot_question = build_plot_question(book, facts)
+    if plot_question is not None:
+        deep_questions.append(plot_question)
+    deep_questions.extend(build_curated_deep_questions(facts))
+    followups.extend(q for q in deep_questions if not overlaps_opening(clue, q))
+
     personal = build_personal_question(book, events)
     if personal:
         followups.append(personal)
