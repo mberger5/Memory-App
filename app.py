@@ -39,20 +39,22 @@ from quiz_engine import (
 )
 
 APP_DIR = Path(__file__).resolve().parent
-DEFAULT_WORKBOOK = APP_DIR / "Maks_Booklist_enriched_2026-07-29_quiz_facts_pilot.xlsx"
+DEFAULT_WORKBOOK = APP_DIR / "Maks_Booklist_enriched_2026-08-04_quiz_facts_learning_pilot.xlsx"
 HISTORY_FILE = APP_DIR / ".book_quiz_history_v2.csv"
 
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 WIKIPEDIA_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 USER_AGENT = "MaksBookQuiz/2.0 (personal Streamlit app)"
-APP_VERSION = "Part 5 Pilot Fix 1"
+APP_VERSION = "Part 5 Learning Pilot Fix 2"
 
 SKILL_ORDER = [
     "Book identification",
     "Author identification",
-    "Characters",
     "Plot",
+    "Ending recall",
     "Themes",
+    "Tone & style",
+    "Characters",
     "Personal reading memory",
     "Publication knowledge",
     "Connections",
@@ -203,10 +205,16 @@ def combined_history() -> pd.DataFrame:
 def skill_stats(hist: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for skill in SKILL_ORDER:
-        subset = hist[hist["skill"] == skill] if not hist.empty and "skill" in hist.columns else pd.DataFrame()
-        attempts = len(subset)
-        recall = float(subset["result_score"].mean() * 100) if attempts else 0.0
-        unaided = subset[subset["assistance"] == "unaided"] if attempts and "assistance" in subset.columns else pd.DataFrame()
+        subset = hist[hist["skill"] == skill].copy() if not hist.empty and "skill" in hist.columns else pd.DataFrame()
+        skipped = int((subset.get("subtype", pd.Series(dtype=str)) == "skip_book").sum()) if not subset.empty else 0
+        if not subset.empty:
+            subset["result_score"] = pd.to_numeric(subset["result_score"], errors="coerce")
+            graded = subset[subset["result_score"].notna()].copy()
+        else:
+            graded = pd.DataFrame()
+        attempts = len(graded)
+        recall = float(graded["result_score"].mean() * 100) if attempts else 0.0
+        unaided = graded[graded["assistance"] == "unaided"] if attempts and "assistance" in graded.columns else pd.DataFrame()
         unaided_attempts = len(unaided)
         unaided_recall = float(unaided["result_score"].mean() * 100) if unaided_attempts else 0.0
         rows.append(
@@ -216,10 +224,10 @@ def skill_stats(hist: pd.DataFrame) -> pd.DataFrame:
                 "Recall": f"{recall:.0f}%" if attempts else "—",
                 "Unaided attempts": unaided_attempts,
                 "Unaided recall": f"{unaided_recall:.0f}%" if unaided_attempts else "—",
+                "Skipped": skipped,
             }
         )
     return pd.DataFrame(rows)
-
 
 def log_question_result(
     round_obj: QuizRound,
@@ -256,6 +264,30 @@ def log_question_result(
             "points_awarded": points_awarded,
             "max_points": max_points,
             "response_seconds": round(max(0.0, time.time() - started_at), 1),
+        }
+    )
+
+
+def log_skip_result(round_obj: QuizRound) -> None:
+    append_history(
+        {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "round_id": round_obj.round_id,
+            "book_key": round_obj.book_key,
+            "title": round_obj.title,
+            "author": round_obj.author,
+            "stage": "opening",
+            "skill": "Book identification",
+            "subtype": "skip_book",
+            "question": re.sub(r"\s+", " ", round_obj.opening_prompt).strip(),
+            "answer_mode": "skip",
+            "assistance": "skipped",
+            "user_answer": "",
+            "correct_answer": round_obj.opening_answer,
+            "result_score": None,
+            "points_awarded": 0.0,
+            "max_points": 0.0,
+            "response_seconds": round(max(0.0, time.time() - st.session_state.opening_started_at), 1),
         }
     )
 
@@ -346,6 +378,8 @@ def initialize_session() -> None:
         "followup_index": 0,
         "followup_attempts": 0,
         "followup_show_mc": False,
+        "followup_hint_used": False,
+        "followup_assistance": "unaided",
         "followup_revealed": False,
         "followup_completed": False,
         "followup_feedback": "",
@@ -361,6 +395,8 @@ def initialize_session() -> None:
 def reset_followup_state() -> None:
     st.session_state.followup_attempts = 0
     st.session_state.followup_show_mc = False
+    st.session_state.followup_hint_used = False
+    st.session_state.followup_assistance = "unaided"
     st.session_state.followup_revealed = False
     st.session_state.followup_completed = False
     st.session_state.followup_feedback = ""
@@ -466,7 +502,7 @@ def current_points() -> tuple[float, float]:
     )
 
 
-def render_opening(round_obj: QuizRound) -> None:
+def render_opening(round_obj: QuizRound, books: list[dict], facts_by_key: dict[str, dict], target_mix: str, difficulty: str) -> None:
     st.progress(0.05, text="Opening identification")
     st.markdown('<div class="question-card">', unsafe_allow_html=True)
     st.markdown(round_obj.opening_prompt)
@@ -542,17 +578,29 @@ def render_opening(round_obj: QuizRound) -> None:
                     )
                     st.rerun()
 
-        if st.button("Reveal the answer", use_container_width=True):
-            resolve_opening(
-                round_obj,
-                user_answer="",
-                result_score=0.0,
-                points=0.0,
-                answer_mode="revealed",
-                assistance="revealed",
-                feedback=f"The answer is {round_obj.opening_answer}.",
-            )
-            st.rerun()
+        reveal_col, skip_col = st.columns(2)
+        with reveal_col:
+            if st.button("Reveal the answer", use_container_width=True):
+                resolve_opening(
+                    round_obj,
+                    user_answer="",
+                    result_score=0.0,
+                    points=0.0,
+                    answer_mode="revealed",
+                    assistance="revealed",
+                    feedback=f"The answer is {round_obj.opening_answer}.",
+                )
+                st.rerun()
+        with skip_col:
+            if st.button(
+                "Skip this book",
+                use_container_width=True,
+                key=f"skip_opening_{round_obj.round_id}",
+            ):
+                log_skip_result(round_obj)
+                start_new_round(books, facts_by_key, target_mix, difficulty)
+                st.rerun()
+        st.caption("Skipping starts a different book and does not count as a wrong answer.")
 
     else:
         if "Correct" in st.session_state.opening_feedback:
@@ -721,6 +769,109 @@ def render_self_followup(round_obj: QuizRound, question: FollowUpQuestion) -> No
             st.rerun()
 
 
+
+def render_self_help_followup(round_obj: QuizRound, question: FollowUpQuestion) -> None:
+    if st.session_state.followup_completed:
+        if st.session_state.followup_user_answer:
+            st.markdown("**Your answer or choice:**")
+            st.markdown(f"> {st.session_state.followup_user_answer}")
+        st.markdown("**Prepared ending:**")
+        st.markdown(question.answer)
+        return
+
+    if not st.session_state.followup_revealed:
+        with st.form(key=f"self_help_form_{question.question_id}"):
+            answer = st.text_area(
+                "What do you remember about the ending?",
+                placeholder="A rough description is enough.",
+                height=120,
+            )
+            submitted = st.form_submit_button("Show the ending", type="primary", use_container_width=True)
+        if submitted:
+            st.session_state.followup_user_answer = answer
+            st.session_state.followup_revealed = True
+            if st.session_state.followup_show_mc:
+                st.session_state.followup_assistance = "multiple_choice"
+            elif st.session_state.followup_hint_used:
+                st.session_state.followup_assistance = "hint_1"
+            else:
+                st.session_state.followup_assistance = "unaided"
+            st.rerun()
+
+        help_col, choice_col = st.columns(2)
+        with help_col:
+            if not st.session_state.followup_hint_used and question.hint:
+                if st.button("Give me a hint", key=f"ending_hint_{question.question_id}", use_container_width=True):
+                    st.session_state.followup_hint_used = True
+                    st.session_state.followup_assistance = "hint_1"
+                    st.rerun()
+        with choice_col:
+            if question.options and not st.session_state.followup_show_mc:
+                if st.button("Show multiple choice", key=f"ending_choices_{question.question_id}", use_container_width=True):
+                    st.session_state.followup_show_mc = True
+                    st.session_state.followup_assistance = "multiple_choice"
+                    st.rerun()
+
+        if st.session_state.followup_hint_used and question.hint:
+            st.info(f"**Hint:** {question.hint}")
+
+        if st.session_state.followup_show_mc and question.options:
+            st.markdown("#### Multiple choice")
+            for index, option in enumerate(question.options):
+                if st.button(option, key=f"ending_option_{question.question_id}_{index}", use_container_width=True):
+                    st.session_state.followup_user_answer = option
+                    st.session_state.followup_revealed = True
+                    st.session_state.followup_assistance = "multiple_choice"
+                    st.rerun()
+
+        if st.button("Reveal ending", key=f"reveal_ending_{question.question_id}", use_container_width=True):
+            st.session_state.followup_user_answer = ""
+            st.session_state.followup_revealed = True
+            st.session_state.followup_assistance = "revealed"
+            st.rerun()
+        return
+
+    if st.session_state.followup_user_answer:
+        st.markdown("**Your answer or choice:**")
+        st.markdown(f"> {st.session_state.followup_user_answer}")
+        if st.session_state.followup_assistance == "multiple_choice" and question.acceptable_answers:
+            if answer_matches(st.session_state.followup_user_answer, question.acceptable_answers):
+                st.success("That choice matches the prepared ending.")
+            else:
+                st.info("That choice does not match the prepared ending, but grade how much came back to you after reading it.")
+    else:
+        st.caption("You revealed the ending without entering an answer.")
+
+    st.markdown("**Prepared ending:**")
+    st.markdown(question.answer)
+    st.caption("Now grade whether the ending came back to you—not whether your wording was exact.")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        remembered = st.button("Remembered", key=f"ending_remembered_{question.question_id}", use_container_width=True)
+    with col2:
+        partial = st.button("Partial", key=f"ending_partial_{question.question_id}", use_container_width=True)
+    with col3:
+        missed = st.button("Missed", key=f"ending_missed_{question.question_id}", use_container_width=True)
+    if remembered or partial or missed:
+        if remembered:
+            score, label = 1.0, "Remembered."
+        elif partial:
+            score, label = 0.5, "Partially remembered."
+        else:
+            score, label = 0.0, "Missed."
+        resolve_followup(
+            round_obj,
+            question,
+            user_answer=st.session_state.followup_user_answer,
+            result_score=score,
+            points=score,
+            answer_mode="self_grade",
+            assistance=st.session_state.followup_assistance,
+            feedback=label,
+        )
+        st.rerun()
+
+
 def render_followup(round_obj: QuizRound) -> None:
     index = st.session_state.followup_index
     if index >= len(round_obj.followups):
@@ -738,7 +889,9 @@ def render_followup(round_obj: QuizRound) -> None:
     if question.spoiler:
         st.warning("This follow-up contains a spoiler.")
 
-    if question.grading == "self":
+    if question.grading == "self_help":
+        render_self_help_followup(round_obj, question)
+    elif question.grading == "self":
         render_self_followup(round_obj, question)
     elif question.grading == "choice":
         render_choice_followup(round_obj, question)
@@ -753,8 +906,12 @@ def render_followup(round_obj: QuizRound) -> None:
         else:
             st.info(st.session_state.followup_feedback)
         st.markdown(question.explanation)
-        if question.grading != "self" or not st.session_state.followup_revealed:
+        if question.grading not in {"self", "self_help"} or not st.session_state.followup_revealed:
             st.markdown(f"**Answer:** {question.answer}")
+        if question.refresher:
+            with st.expander("Read the story refresher (stops before the ending)", expanded=False):
+                st.markdown(question.refresher)
+            st.caption("The next question asks whether you now remember how the book ends.")
         button_label = "Finish round" if index + 1 >= len(round_obj.followups) else "Next follow-up"
         if st.button(
             button_label,
@@ -783,8 +940,14 @@ def render_round_end(round_obj: QuizRound, books: list[dict], facts_by_key: dict
         curated = [fact for fact in curated if fact]
         if curated:
             st.markdown("\n".join(f"- {fact}" for fact in curated))
-    with st.spinner("Checking for a couple of additional web facts..."):
-        st.markdown(web_facts_markdown(round_obj.title, round_obj.author))
+    sources = unique_nonempty([
+        clean_text(round_obj.facts.get("Source 1")),
+        clean_text(round_obj.facts.get("Source 2")),
+        clean_text(round_obj.facts.get("Source 3")),
+    ])
+    if sources:
+        with st.expander("Sources used for the curated material"):
+            st.markdown("\n".join(f"- {source}" for source in sources))
 
     if st.button("Start another round", type="primary", use_container_width=True):
         start_new_round(books, facts_by_key, target_mix, difficulty)
@@ -801,7 +964,7 @@ def main() -> None:
     initialize_session()
 
     st.title("📚 Maks Book Memory Quiz")
-    st.caption(f"{APP_VERSION} · Enriched books only. Identify the title first; the author is kept hidden until the author follow-up, and every round includes a curated plot question.")
+    st.caption(f"{APP_VERSION} · Enriched books only. Each round moves from title and author recall into an easy plot check, a skimmable refresher, ending recall, theme, tone/style, and your own reading memory.")
 
     with st.sidebar:
         st.header("Booklist")
@@ -824,7 +987,7 @@ def main() -> None:
         if not complete_fact_keys:
             st.error(
                 "This workbook has no fully enriched Quiz Facts rows. "
-                "Each eligible book needs complete opening clues, hints, plot, character, and theme fields."
+                "Each eligible book needs complete opening clues, easy plot options, a no-ending refresher, ending material, theme, and tone/style fields."
             )
             return
         enriched_rows = prepared_rows[
@@ -894,16 +1057,17 @@ def main() -> None:
     hist = combined_history()
     total_points = float(hist["points_awarded"].sum()) if not hist.empty else 0.0
     total_max = float(hist["max_points"].sum()) if not hist.empty else 0.0
-    total_recall = float(hist["result_score"].mean() * 100) if not hist.empty else 0.0
+    graded_scores = pd.to_numeric(hist["result_score"], errors="coerce") if not hist.empty else pd.Series(dtype=float)
+    total_recall = float(graded_scores.mean() * 100) if graded_scores.notna().any() else 0.0
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Session points", f"{session_points:g}/{session_max:g}")
     col2.metric("Cumulative points", f"{total_points:g}/{total_max:g}")
-    col3.metric("Recall", f"{total_recall:.0f}%" if not hist.empty else "—")
-    st.caption(f"Current quiz pool: **{len(books)} fully enriched books**. Every round guarantees a curated plot question plus a character-or-theme question. Detailed history is still stored on the Streamlit server until Part 6 adds durable storage.")
+    col3.metric("Recall", f"{total_recall:.0f}%" if graded_scores.notna().any() else "—")
+    st.caption(f"Current quiz pool: **{len(books)} fully enriched books**. Every round uses the learning sequence: title → author → easy plot → refresher → ending → theme → tone/style → personal memory. Detailed history is still stored on the Streamlit server until Part 6 adds durable storage.")
 
     if st.session_state.stage == "identify":
-        render_opening(round_obj)
+        render_opening(round_obj, books, facts_by_key, target_mix, difficulty)
     elif st.session_state.stage == "followup":
         render_followup(round_obj)
     else:
@@ -912,7 +1076,7 @@ def main() -> None:
     with st.expander("Skill statistics"):
         st.caption("Each question is stored separately, so title, author, personal-memory, publication, and connection performance can diverge.")
         st.dataframe(skill_stats(hist), hide_index=True, use_container_width=True)
-        st.info("This pilot tracks plot, character, and theme recall separately. Every eligible book has complete curated enrichment, and plot recall is guaranteed in each round.")
+        st.info("This pilot separately tracks title, author, plot, ending, theme, tone/style, and personal-memory performance. Skipped books are counted separately and do not affect recall accuracy.")
 
     with st.expander("Recent results"):
         if hist.empty:

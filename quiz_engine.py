@@ -39,14 +39,32 @@ FACT_COLUMNS = {
     "hint_2": ["Hint 2"],
     "plot_question": ["Plot Question"],
     "plot_answer": ["Plot Answer", "Central Conflict"],
-    "character_question": ["Character Question"],
-    "character_answer": ["Character Answer", "Major Characters"],
+    "plot_choice_answer": ["Plot Choice Answer"],
+    "plot_distractor_1": ["Plot Distractor 1"],
+    "plot_distractor_2": ["Plot Distractor 2"],
+    "plot_distractor_3": ["Plot Distractor 3"],
+    "plot_refresher": ["Plot Refresher (No Ending)"],
+    "ending_question": ["Ending Question"],
+    "ending_hint": ["Ending Hint"],
+    "ending_answer": ["Ending Answer"],
+    "ending_choice_answer": ["Ending Choice Answer"],
+    "ending_distractor_1": ["Ending Distractor 1"],
+    "ending_distractor_2": ["Ending Distractor 2"],
+    "ending_distractor_3": ["Ending Distractor 3"],
     "theme_question": ["Theme Question"],
     "theme_answer": ["Theme Answer", "Major Themes"],
+    "tone_question": ["Tone/Style Question"],
+    "tone_answer": ["Tone/Style Answer"],
+    "tone_distractor_1": ["Tone/Style Distractor 1"],
+    "tone_distractor_2": ["Tone/Style Distractor 2"],
+    "tone_distractor_3": ["Tone/Style Distractor 3"],
+    "character_question": ["Character Question"],
+    "character_answer": ["Character Answer", "Major Characters"],
     "fun_fact_1": ["Fun Fact 1"],
     "fun_fact_2": ["Fun Fact 2"],
     "source_1": ["Source 1"],
     "source_2": ["Source 2"],
+    "source_3": ["Source 3"],
 }
 
 REQUIRED_ENRICHMENT_FIELDS = (
@@ -57,10 +75,25 @@ REQUIRED_ENRICHMENT_FIELDS = (
     "hint_2",
     "plot_question",
     "plot_answer",
-    "character_question",
-    "character_answer",
+    "plot_choice_answer",
+    "plot_distractor_1",
+    "plot_distractor_2",
+    "plot_distractor_3",
+    "plot_refresher",
+    "ending_question",
+    "ending_hint",
+    "ending_answer",
+    "ending_choice_answer",
+    "ending_distractor_1",
+    "ending_distractor_2",
+    "ending_distractor_3",
     "theme_question",
     "theme_answer",
+    "tone_question",
+    "tone_answer",
+    "tone_distractor_1",
+    "tone_distractor_2",
+    "tone_distractor_3",
 )
 
 
@@ -73,8 +106,10 @@ class FollowUpQuestion:
     answer: str
     acceptable_answers: list[str] = field(default_factory=list)
     options: list[str] = field(default_factory=list)
-    grading: str = "auto"  # auto | choice | self
+    grading: str = "auto"  # auto | choice | self | self_help
     explanation: str = ""
+    refresher: str = ""
+    hint: str = ""
     spoiler: bool = False
     max_points: float = 1.0
 
@@ -342,6 +377,13 @@ def fact_value(facts: dict, key: str) -> str:
     return ""
 
 
+def fact_options(facts: dict, answer_key: str, distractor_keys: list[str]) -> tuple[str, list[str]]:
+    answer = fact_value(facts, answer_key)
+    options = unique_nonempty([answer] + [fact_value(facts, key) for key in distractor_keys])
+    random.shuffle(options)
+    return answer, options
+
+
 def has_complete_enrichment(facts: dict) -> bool:
     return bool(facts) and all(fact_value(facts, key) for key in REQUIRED_ENRICHMENT_FIELDS)
 
@@ -528,86 +570,92 @@ def build_counterpart_question(book: dict, opening_target: str, all_books: list[
 
 
 def build_plot_question(book: dict, facts: dict) -> FollowUpQuestion | None:
-    # A generic question based on Summary (AI) simply repeats the opening clue,
-    # so plot follow-ups are included only when Part 5 supplies a distinct,
-    # curated question and answer.
-    custom_question = fact_value(facts, "plot_question")
-    custom_answer = fact_value(facts, "plot_answer")
-    if not custom_question or not custom_answer:
+    question = fact_value(facts, "plot_question")
+    detailed_answer = fact_value(facts, "plot_answer")
+    choice_answer, options = fact_options(
+        facts,
+        "plot_choice_answer",
+        ["plot_distractor_1", "plot_distractor_2", "plot_distractor_3"],
+    )
+    refresher = fact_value(facts, "plot_refresher")
+    if not all([question, detailed_answer, choice_answer, refresher]) or len(options) < 4:
         return None
     return FollowUpQuestion(
         question_id=str(uuid.uuid4()),
         skill="Plot",
-        subtype="curated_plot",
-        prompt=custom_question,
-        answer=custom_answer,
-        acceptable_answers=[],
-        grading="self",
-        explanation="Compare your answer with the prepared plot answer, then grade your own recall.",
+        subtype="high_level_plot",
+        prompt=question,
+        answer=choice_answer,
+        acceptable_answers=[choice_answer],
+        options=options,
+        grading="choice",
+        explanation=f"**High-level answer:** {detailed_answer}",
+        refresher=refresher,
     )
 
 
-def meaningful_tokens(value: object) -> set[str]:
-    stopwords = {
-        "about", "after", "again", "against", "also", "another", "because",
-        "been", "before", "book", "central", "does", "from", "have", "into",
-        "major", "more", "most", "novel", "question", "story", "that", "their",
-        "theme", "themes", "there", "these", "they", "this", "through", "what",
-        "when", "where", "which", "while", "with", "without", "would",
-    }
-    return {
-        token
-        for token in normalize_answer(value).split()
-        if len(token) >= 4 and token not in stopwords
-    }
+def build_ending_question(facts: dict) -> FollowUpQuestion | None:
+    question = fact_value(facts, "ending_question")
+    hint = fact_value(facts, "ending_hint")
+    answer = fact_value(facts, "ending_answer")
+    choice_answer, options = fact_options(
+        facts,
+        "ending_choice_answer",
+        ["ending_distractor_1", "ending_distractor_2", "ending_distractor_3"],
+    )
+    if not all([question, hint, answer, choice_answer]) or len(options) < 4:
+        return None
+    return FollowUpQuestion(
+        question_id=str(uuid.uuid4()),
+        skill="Ending recall",
+        subtype="ending_after_refresher",
+        prompt=question,
+        answer=answer,
+        acceptable_answers=[choice_answer],
+        options=options,
+        grading="self_help",
+        explanation="Use the refresher as a memory cue; exact wording is not important.",
+        hint=hint,
+        spoiler=True,
+    )
 
 
-def overlaps_opening(opening_clue: str, question: FollowUpQuestion) -> bool:
-    opening = meaningful_tokens(opening_clue)
-    if not opening:
-        return False
-    answer_tokens = meaningful_tokens(question.answer)
-    prompt_tokens = meaningful_tokens(question.prompt)
-    # Skip a follow-up when most of its substantive answer was already supplied
-    # in the opening clue, or when the question itself substantially repeats it.
-    answer_overlap = len(opening & answer_tokens) / max(1, len(answer_tokens))
-    prompt_overlap = len(opening & prompt_tokens) / max(1, len(prompt_tokens))
-    return answer_overlap >= 0.65 or prompt_overlap >= 0.75
+def build_theme_question(facts: dict) -> FollowUpQuestion | None:
+    question = fact_value(facts, "theme_question")
+    answer = fact_value(facts, "theme_answer")
+    if not question or not answer:
+        return None
+    return FollowUpQuestion(
+        question_id=str(uuid.uuid4()),
+        skill="Themes",
+        subtype="broad_theme",
+        prompt=question,
+        answer=answer,
+        grading="self",
+        explanation="Grade whether you remembered the broad idea, not the exact phrasing.",
+    )
 
 
-def build_curated_deep_questions(facts: dict) -> list[FollowUpQuestion]:
-    output: list[FollowUpQuestion] = []
-    character_question = fact_value(facts, "character_question")
-    character_answer = fact_value(facts, "character_answer")
-    if character_question and character_answer:
-        output.append(
-            FollowUpQuestion(
-                question_id=str(uuid.uuid4()),
-                skill="Characters",
-                subtype="curated_character",
-                prompt=character_question,
-                answer=character_answer,
-                acceptable_answers=[character_answer],
-                grading="self",
-                explanation="Compare your response with the prepared character answer.",
-            )
-        )
-    theme_question = fact_value(facts, "theme_question")
-    theme_answer = fact_value(facts, "theme_answer")
-    if theme_question and theme_answer:
-        output.append(
-            FollowUpQuestion(
-                question_id=str(uuid.uuid4()),
-                skill="Themes",
-                subtype="curated_theme",
-                prompt=theme_question,
-                answer=theme_answer,
-                grading="self",
-                explanation="Compare your response with the prepared theme answer.",
-            )
-        )
-    return output
-
+def build_tone_question(facts: dict) -> FollowUpQuestion | None:
+    question = fact_value(facts, "tone_question")
+    answer, options = fact_options(
+        facts,
+        "tone_answer",
+        ["tone_distractor_1", "tone_distractor_2", "tone_distractor_3"],
+    )
+    if not question or not answer or len(options) < 4:
+        return None
+    return FollowUpQuestion(
+        question_id=str(uuid.uuid4()),
+        skill="Tone & style",
+        subtype="tone_style_choice",
+        prompt=question,
+        answer=answer,
+        acceptable_answers=[answer],
+        options=options,
+        grading="choice",
+        explanation="This is a broad description of the book's dominant tone and narrative style.",
+    )
 
 def rating_band(rating: float) -> str:
     if rating >= 3.5:
@@ -814,26 +862,22 @@ def build_round(
     hints = safe_hints
     options = build_options(current, books, target)
 
-    # Fixed opening sequence: title first, author second, plot immediately after.
+    # Learning-mode sequence: title, author, easy plot, refresher-powered ending,
+    # broad theme, tone/style, and one personal-memory prompt.
     followups: list[FollowUpQuestion] = [build_counterpart_question(book, target, books)]
-    plot_question = build_plot_question(book, facts)
-    if plot_question is None:
-        raise ValueError("The selected book is missing a curated plot question.")
-    followups.append(plot_question)
-
-    # Add one additional deep-recall question each round. Repeated rounds can
-    # therefore build separate character and theme statistics without making
-    # every round unnecessarily long.
-    additional_deep = build_curated_deep_questions(facts)
-    if additional_deep:
-        followups.append(random.choice(additional_deep))
+    required_followups = [
+        build_plot_question(book, facts),
+        build_ending_question(facts),
+        build_theme_question(facts),
+        build_tone_question(facts),
+    ]
+    if any(question is None for question in required_followups):
+        raise ValueError("The selected book is missing required learning-mode Quiz Facts fields.")
+    followups.extend(question for question in required_followups if question is not None)
 
     personal = build_personal_question(book, events)
     if personal:
         followups.append(personal)
-    knowledge = build_knowledge_question(book, key, books)
-    if knowledge:
-        followups.append(knowledge)
 
     return QuizRound(
         round_id=str(uuid.uuid4()),
